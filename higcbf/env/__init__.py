@@ -2,21 +2,11 @@ import copy
 from typing import Optional
 
 from .base import MultiAgentEnv
-from .single_integrator import SingleIntegrator
-from .double_integrator import DoubleIntegrator
-from .linear_drone import LinearDrone
-from .dubins_car import DubinsCar
-from .crazyflie import CrazyFlie
 from .robot_ped_env import RobotPedEnv
 
 
 ENV = {
-    'SingleIntegrator': SingleIntegrator,
-    'DoubleIntegrator': DoubleIntegrator,
-    'LinearDrone': LinearDrone,
-    'DubinsCar': DubinsCar,
-    'CrazyFlie': CrazyFlie,
-    'RobotPedEnv': RobotPedEnv,
+    "RobotPedEnv": RobotPedEnv,
 }
 
 

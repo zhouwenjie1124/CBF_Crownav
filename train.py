@@ -231,44 +231,49 @@ def train(args):
         args.curriculum = None
 
     # create low level controller
-    algo = make_algo(
-        algo=args.algo,
-        env=env,
-        node_dim=env.node_dim,
-        edge_dim=env.edge_dim,
-        state_dim=env.state_dim,
-        action_dim=env.action_dim,
-        n_agents=env.num_agents,
-        gnn_layers=args.gnn_layers,
-        batch_size=256,
-        buffer_size=args.buffer_size,
-        horizon=args.horizon,
-        lr_actor=args.lr_actor,
-        lr_cbf=args.lr_cbf,
-        alpha=args.alpha,
-        eps=0.02,
-        inner_epoch=8,
-        loss_action_coef=args.loss_action_coef,
-        loss_unsafe_coef=args.loss_unsafe_coef,
-        loss_safe_coef=args.loss_safe_coef,
-        loss_h_dot_coef=args.loss_h_dot_coef,
-        max_grad_norm=args.max_grad_norm,
-        gamma=args.gamma,
-        gae_lambda=args.gae_lambda,
-        clip_ratio=args.clip_ratio,
-        ppo_epochs=args.ppo_epochs,
-        minibatch_size=args.minibatch_size,
-        lr_value=args.lr_value,
-        ent_coef=args.ent_coef,
-        vf_coef=args.vf_coef,
-        vf_clip_range=args.vf_clip_range,
-        concat_robot_state=args.concat_robot_state,
-        use_gru=args.use_gru,
-        rnn_hidden_dim=args.rnn_hidden_dim,
-        rnn_seq_len=args.rnn_seq_len,
-        rnn_minibatch_chunks=args.rnn_minibatch_chunks,
-        seed=args.seed,
-    )
+    algo_kwargs = {
+        "algo": args.algo,
+        "env": env,
+        "node_dim": env.node_dim,
+        "edge_dim": env.edge_dim,
+        "state_dim": env.state_dim,
+        "action_dim": env.action_dim,
+        "n_agents": env.num_agents,
+        "seed": args.seed,
+    }
+    if args.algo == "ppo":
+        algo_kwargs.update(
+            {
+                "gnn_layers": args.gnn_layers,
+                "max_grad_norm": args.max_grad_norm,
+                "lr_actor": args.lr_actor,
+                "lr_value": args.lr_value,
+                "gamma": args.gamma,
+                "gae_lambda": args.gae_lambda,
+                "clip_ratio": args.clip_ratio,
+                "ppo_epochs": args.ppo_epochs,
+                "minibatch_size": args.minibatch_size,
+                "ent_coef": args.ent_coef,
+                "vf_coef": args.vf_coef,
+                "vf_clip_range": args.vf_clip_range,
+                "concat_robot_state": args.concat_robot_state,
+                "use_gru": args.use_gru,
+                "rnn_hidden_dim": args.rnn_hidden_dim,
+                "rnn_seq_len": args.rnn_seq_len,
+                "rnn_minibatch_chunks": args.rnn_minibatch_chunks,
+            }
+        )
+    elif args.algo == "dec_share_cbf":
+        algo_kwargs.update(
+            {
+                "alpha": args.alpha,
+            }
+        )
+    else:
+        raise ValueError(
+            f"Unsupported algo '{args.algo}'. Available: ppo, dec_share_cbf."
+        )
+    algo = make_algo(**algo_kwargs)
 
     # get training parameters
     train_params = {
@@ -351,8 +356,8 @@ def main():
 
     # custom arguments
     parser.add_argument("-n", "--num-agents", type=int, default=1)
-    parser.add_argument("--algo", type=str, default="gcbf+")
-    parser.add_argument("--env", type=str, default="SimpleCar")
+    parser.add_argument("--algo", type=str, default="ppo", choices=["ppo", "dec_share_cbf"])
+    parser.add_argument("--env", type=str, default="RobotPedEnv", choices=["RobotPedEnv"])
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--steps", type=int, default=1000) # maximum training steps
     parser.add_argument("--name", type=str, default=None)
@@ -374,11 +379,9 @@ def main():
         type=str,
         nargs="*",
         default=None,
-        help=(
-            "Override RobotPedEnv reward params with key=value entries, "
-            "e.g. --reward-override kappa_succ=60 kappa_ttc=-0.2 kappa_inv=-0.05."
-        ),
+        help="Override env reward params with key=value entries.",
     )
+
     parser.add_argument("--train-cbf-filter", action="store_true", default=False)
     parser.add_argument("--train-cbf-alpha", type=float, default=1.0)
     parser.add_argument("--train-cbf-sigma", type=float, default=0.3)
@@ -404,20 +407,12 @@ def main():
         anti_stuck_use_obs_blocked=None,
     )
 
-    # gcbf / gcbf+ arguments
-    parser.add_argument("--gnn-layers", type=int, default=1)
+    # dec_share_cbf arguments
     parser.add_argument("--alpha", type=float, default=1.0)
-    parser.add_argument("--horizon", type=int, default=32)
-    parser.add_argument("--lr-actor", type=float, default=3e-5)
-    parser.add_argument("--lr-cbf", type=float, default=3e-5)
-    parser.add_argument("--loss-action-coef", type=float, default=0.0001)
-    parser.add_argument("--loss-unsafe-coef", type=float, default=1.0)
-    parser.add_argument("--loss-safe-coef", type=float, default=1.0)
-    parser.add_argument("--loss-h-dot-coef", type=float, default=0.01)
-    parser.add_argument("--buffer-size", type=int, default=512)
-    parser.add_argument("--max-grad-norm", type=float, default=2.0)
 
     # PPO arguments
+    parser.add_argument("--gnn-layers", type=int, default=1)
+    parser.add_argument("--lr-actor", type=float, default=3e-4)
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--gae-lambda", type=float, default=0.95)
     parser.add_argument("--clip-ratio", type=float, default=0.1)
@@ -427,11 +422,14 @@ def main():
     parser.add_argument("--ent-coef", type=float, default=0.01)
     parser.add_argument("--vf-coef", type=float, default=0.5)
     parser.add_argument("--vf-clip-range", type=float, default=0.2)
+    parser.add_argument("--max-grad-norm", type=float, default=0.5)
     parser.add_argument("--concat-robot-state", action="store_true", default=False)
     parser.add_argument("--use-gru", action="store_true", default=False)
     parser.add_argument("--rnn-hidden-dim", type=int, default=64)
     parser.add_argument("--rnn-seq-len", type=int, default=32)
     parser.add_argument("--rnn-minibatch-chunks", type=int, default=64)
+    parser.add_argument("--curriculum-config", type=str, default=None)
+    parser.add_argument("--curriculum-start-stage", type=int, default=None)
 
     # default arguments
     parser.add_argument("--n-env-train", type=int, default=16) # number of parallel training environments
@@ -443,18 +441,6 @@ def main():
     parser.add_argument("--resume", action="store_true", default=False)
     parser.add_argument("--resume-dir", type=str, default=None)
     parser.add_argument("--resume-step", type=int, default=None)
-    parser.add_argument(
-        "--curriculum-config",
-        type=str,
-        default=None,
-        help="Path to curriculum YAML config. When omitted, curriculum learning is disabled.",
-    )
-    parser.add_argument(
-        "--curriculum-start-stage",
-        type=int,
-        default=None,
-        help="Optional curriculum start stage. If resuming and state exists, saved stage takes precedence.",
-    )
 
     args = parser.parse_args()
     train(args)

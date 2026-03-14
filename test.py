@@ -16,118 +16,13 @@ try:
 except ImportError:  # pragma: no cover - optional debug dependency
     ipdb = None
 
-from higcbf.algo import GCBF, GCBFPlus, make_algo, CentralizedCBF, DecShareCBF
+from higcbf.algo import make_algo
 from higcbf.env import make_env
-from higcbf.env.robot_ped_env import RobotPedEnv
 from higcbf.env.base import RolloutResult
 from higcbf.trainer.utils import get_bb_cbf
-from higcbf.utils.graph import EdgeBlock, GetGraph, GraphsTuple
-from higcbf.utils.typing import Action, Array
-from higcbf.utils.utils import jax_jit_np, tree_index, chunk_vmap, merge01, jax_vmap, tree_concat_at_front
-
-
-def _is_dubins_to_robotped_transfer(source_env_id: str, target_env_id: str) -> bool:
-    return source_env_id == "DubinsCar" and target_env_id == "RobotPedEnv"
-
-
-def _robotped_to_dubins_graph(
-    robot_graph: GraphsTuple,
-    n_rays: int,
-    comm_radius: float,
-) -> GraphsTuple:
-    if n_rays <= 0:
-        raise ValueError(f"n_rays must be positive for Dubins transfer, got {n_rays}.")
-
-    # Read robot state (x, y, theta, v, w) and keep Dubins-compatible subset (x, y, theta, v).
-    agent_full = robot_graph.type_states(type_idx=RobotPedEnv.AGENT, n_type=1)
-    agent_state = jnp.concatenate([agent_full[:, :3], agent_full[:, 3:4]], axis=-1)
-    goal_xy = robot_graph.env_states.goal[:, :2]
-    goal_theta = jnp.arctan2(goal_xy[:, 1] - agent_state[:, 1], goal_xy[:, 0] - agent_state[:, 0])
-    goal_state = jnp.concatenate([goal_xy, goal_theta[:, None], jnp.zeros((1, 1), dtype=agent_state.dtype)], axis=-1)
-
-    # Use lidar nodes already built by RobotPedEnv as obstacle hits.
-    lidar_full = robot_graph.type_states(type_idx=RobotPedEnv.OBS, n_type=n_rays)
-    lidar_state = jnp.concatenate([lidar_full[:, :2], jnp.zeros((n_rays, 2), dtype=agent_state.dtype)], axis=-1)
-
-    node_feats = jnp.zeros((2 + n_rays, 3), dtype=agent_state.dtype)
-    node_feats = node_feats.at[0, 2].set(1.0)   # agent
-    node_feats = node_feats.at[1, 1].set(1.0)   # goal
-    node_feats = node_feats.at[2:, 0].set(1.0)  # obs
-
-    node_type = jnp.zeros((2 + n_rays,), dtype=jnp.int32)
-    node_type = node_type.at[1].set(1)  # goal
-    node_type = node_type.at[2:].set(2)  # obs
-
-    id_agent = jnp.array([0], dtype=jnp.int32)
-    id_goal = jnp.array([1], dtype=jnp.int32)
-    id_obs = jnp.arange(2, 2 + n_rays, dtype=jnp.int32)
-
-    agent_pos = agent_state[:, :2]
-    agent_v = jnp.concatenate(
-        [
-            (agent_state[:, 3] * jnp.cos(agent_state[:, 2]))[:, None],
-            (agent_state[:, 3] * jnp.sin(agent_state[:, 2]))[:, None],
-        ],
-        axis=-1,
-    )
-
-    # agent-agent block (kept for shape/layout compatibility; masked out for single robot)
-    pos_diff = agent_pos[:, None, :] - agent_pos[None, :, :]
-    dist = jnp.linalg.norm(pos_diff, axis=-1)
-    dist = dist + jnp.eye(1) * (comm_radius + 1.0)
-    v_diff = agent_v[:, None, :] - agent_v[None, :, :]
-    agent_agent_feats = jnp.concatenate([pos_diff, v_diff], axis=-1)
-    agent_agent_mask = dist < comm_radius
-    agent_agent_edges = EdgeBlock(agent_agent_feats, agent_agent_mask, id_agent, id_agent)
-
-    # agent-goal block
-    goal_rel = agent_state[:, :2] - goal_state[:, :2]
-    agent_goal_feats = jnp.concatenate([goal_rel, agent_v], axis=-1)
-    goal_norm = jnp.sqrt(1e-6 + jnp.sum(agent_goal_feats[:, :2] ** 2, axis=-1, keepdims=True))
-    safe_goal_norm = jnp.maximum(goal_norm, comm_radius)
-    goal_coef = jnp.where(goal_norm > comm_radius, comm_radius / safe_goal_norm, 1.0)
-    agent_goal_feats = agent_goal_feats.at[:, :2].set(agent_goal_feats[:, :2] * goal_coef)
-    agent_goal_edges = EdgeBlock(
-        edge_feats=agent_goal_feats[None, :, :],
-        edge_mask=jnp.ones((1, 1), dtype=bool),
-        ids_recv=id_agent,
-        ids_send=id_goal,
-    )
-
-    # agent-obstacle(lidar) block
-    lidar_pos = agent_pos[0, :] - lidar_state[:, :2]
-    lidar_feats = jnp.concatenate([agent_state[0, :2], agent_v[0]], axis=0)[None, :] - lidar_state
-    lidar_dist = jnp.linalg.norm(lidar_pos, axis=-1)
-    active_lidar = lidar_dist < (comm_radius - 1e-1)
-    agent_obs_edges = EdgeBlock(
-        edge_feats=lidar_feats[None, :, :],
-        edge_mask=active_lidar[None, :],
-        ids_recv=id_agent,
-        ids_send=id_obs,
-    )
-
-    return GetGraph(
-        nodes=node_feats,
-        node_type=node_type,
-        edge_blocks=[agent_agent_edges, agent_goal_edges, agent_obs_edges],
-        env_states=robot_graph.env_states,
-        states=jnp.concatenate([agent_state, goal_state, lidar_state], axis=0),
-    ).to_padded()
-
-
-def _map_dubins_action_to_robotped(env, robot_graph: GraphsTuple, dubins_action: Array) -> Array:
-    mode = env.params.get("action_mode", "discrete_delta")
-    if mode in {"continuous_vw", "discrete_vw_grid"}:
-        # Dubins output is [omega, a_v]; convert to RobotPed absolute [w_cmd, v_cmd].
-        robot_state = robot_graph.type_states(type_idx=RobotPedEnv.AGENT, n_type=1)
-        v_now = robot_state[:, 3]
-        w_cmd = dubins_action[:, 0]
-        v_cmd = v_now + dubins_action[:, 1] * env.dt
-        action = jnp.stack([w_cmd, v_cmd], axis=-1)
-    else:
-        # RobotPed default expects [a_w, a_v]; keep the same order as Dubins [omega, a_v].
-        action = dubins_action
-    return env.clip_action(action)
+from higcbf.utils.graph import GraphsTuple
+from higcbf.utils.typing import Array
+from higcbf.utils.utils import jax_jit_np, tree_index, jax_vmap, tree_concat_at_front
 
 
 def test(args):
@@ -172,12 +67,7 @@ def test(args):
         num_ped = getattr(args, "num_ped", None)
         env_params = None
 
-    source_env_id = config.env if config is not None else args.env
-    target_env_id = source_env_id if args.env is None else args.env
-    use_dubins_robotped_transfer = _is_dubins_to_robotped_transfer(source_env_id, target_env_id)
-    if use_dubins_robotped_transfer and args.num_agents is None:
-        num_agents = 1
-        print("Dubins->RobotPed transfer: auto-set num_agents=1 for RobotPedEnv.")
+    target_env_id = config.env if config is not None else args.env
 
     if config is None and args.env is None:
         raise ValueError("--env is required when no --path config is provided.")
@@ -201,7 +91,6 @@ def test(args):
         env.params["terminate_on_collision"] = False
         print("Collision termination disabled for test rollout (continue_after_collision=True).")
 
-    transfer_policy_cfg = None
     if not args.u_ref:
         if args.path is not None:
             path = args.path
@@ -214,29 +103,6 @@ def test(args):
             print("step: ", step)
 
             policy_env = env
-            if use_dubins_robotped_transfer:
-                source_env_params = getattr(config, "env_params", None)
-                if not isinstance(source_env_params, dict):
-                    source_env_params = None
-                policy_env = make_env(
-                    env_id=source_env_id,
-                    num_agents=1,
-                    num_obs=getattr(config, "obs", None),
-                    area_size=area_size,
-                    max_step=max_step,
-                    max_travel=max_travel,
-                    n_rays=getattr(config, "n_rays", None),
-                    env_params=source_env_params,
-                )
-                transfer_policy_cfg = {
-                    "n_rays": int(policy_env.params["n_rays"]),
-                    "comm_radius": float(policy_env.params["comm_radius"]),
-                }
-                print(
-                    "Transfer mode enabled: pretrained DubinsCar policy graph/action "
-                    "adapted for RobotPedEnv evaluation."
-                )
-
             algo_kwargs = {
                 "algo": config.algo,
                 "env": policy_env,
@@ -245,6 +111,7 @@ def test(args):
                 "state_dim": policy_env.state_dim,
                 "action_dim": policy_env.action_dim,
                 "n_agents": policy_env.num_agents,
+                "seed": getattr(config, "seed", 0),
             }
             if config.algo == "ppo":
                 algo_kwargs.update({
@@ -260,64 +127,39 @@ def test(args):
                     "vf_coef": getattr(config, "vf_coef", 0.5),
                     "vf_clip_range": getattr(config, "vf_clip_range", None),
                     "max_grad_norm": getattr(config, "max_grad_norm", 0.5),
-                    "seed": getattr(config, "seed", 0),
                     "concat_robot_state": getattr(config, "concat_robot_state", False),
                     "use_gru": getattr(config, "use_gru", False),
                     "rnn_hidden_dim": getattr(config, "rnn_hidden_dim", 64),
                     "rnn_seq_len": getattr(config, "rnn_seq_len", 32),
                     "rnn_minibatch_chunks": getattr(config, "rnn_minibatch_chunks", 64),
                 })
-            elif config.algo in {"centralized_cbf", "dec_share_cbf"}:
+            elif config.algo == "dec_share_cbf":
                 algo_kwargs.update({
                     "alpha": getattr(config, "alpha", 1.0),
                 })
             else:
-                algo_kwargs.update({
-                    "gnn_layers": getattr(config, "gnn_layers", 1),
-                    "batch_size": getattr(config, "batch_size", 256),
-                    "buffer_size": getattr(config, "buffer_size", 512),
-                    "horizon": getattr(config, "horizon", 32),
-                    "lr_actor": getattr(config, "lr_actor", 3e-5),
-                    "lr_cbf": getattr(config, "lr_cbf", 3e-5),
-                    "alpha": getattr(config, "alpha", 1.0),
-                    "eps": getattr(config, "eps", 0.02),
-                    "inner_epoch": getattr(config, "inner_epoch", 8),
-                    "loss_action_coef": getattr(config, "loss_action_coef", 0.0001),
-                    "loss_unsafe_coef": getattr(config, "loss_unsafe_coef", 1.0),
-                    "loss_safe_coef": getattr(config, "loss_safe_coef", 1.0),
-                    "loss_h_dot_coef": getattr(config, "loss_h_dot_coef", 0.01),
-                    "max_grad_norm": getattr(config, "max_grad_norm", 2.0),
-                    "seed": getattr(config, "seed", 0),
-                })
+                raise ValueError(
+                    f"Unsupported algo '{config.algo}' in config. Available: ppo, dec_share_cbf."
+                )
             algo = make_algo(**algo_kwargs)
             algo.load(model_path, step)
-            if transfer_policy_cfg is None:
-                act_fn = jax.jit(algo.act)
-            else:
-                transfer_n_rays = transfer_policy_cfg["n_rays"]
-                transfer_comm_radius = transfer_policy_cfg["comm_radius"]
-
-                def act_fn_transfer(robot_graph: GraphsTuple) -> Action:
-                    dubins_graph = _robotped_to_dubins_graph(
-                        robot_graph,
-                        n_rays=transfer_n_rays,
-                        comm_radius=transfer_comm_radius,
-                    )
-                    dubins_action = algo.act(dubins_graph)
-                    return _map_dubins_action_to_robotped(env, robot_graph, dubins_action)
-
-                act_fn = jax.jit(act_fn_transfer)
+            act_fn = jax.jit(algo.act)
         else:
-            algo = make_algo(
-                algo=args.algo,
-                env=env,
-                node_dim=env.node_dim,
-                edge_dim=env.edge_dim,
-                state_dim=env.state_dim,
-                action_dim=env.action_dim,
-                n_agents=env.num_agents,
-                alpha=args.alpha,
-            )
+            algo_kwargs = {
+                "algo": args.algo,
+                "env": env,
+                "node_dim": env.node_dim,
+                "edge_dim": env.edge_dim,
+                "state_dim": env.state_dim,
+                "action_dim": env.action_dim,
+                "n_agents": env.num_agents,
+                "seed": args.seed,
+            }
+            if args.algo == "dec_share_cbf":
+                algo_kwargs["alpha"] = args.alpha
+            elif args.algo != "ppo":
+                raise ValueError(f"Unsupported algo '{args.algo}'. Available: ppo, dec_share_cbf.")
+            algo = make_algo(**algo_kwargs)
             act_fn = jax.jit(algo.act)
             path = os.path.join(f"./logs/{args.env}/{args.algo}")
             if not os.path.exists(path):
@@ -340,14 +182,12 @@ def test(args):
     test_keys = jr.split(test_key, 1_000)[: args.epi]
     test_keys = test_keys[args.offset:]
 
-    algo_is_cbf = isinstance(algo, (CentralizedCBF, DecShareCBF))
-
-    if transfer_policy_cfg is not None and args.cbf is not None:
-        print("Warning: --cbf is disabled in Dubins->RobotPed transfer mode.")
-        args.cbf = None
+    algo_supports_cbf = bool(algo is not None and hasattr(algo, "get_cbf"))
+    algo_is_cbf = algo_supports_cbf
 
     if args.cbf is not None:
-        assert isinstance(algo, GCBF) or isinstance(algo, GCBFPlus) or isinstance(algo, CentralizedCBF)
+        if not algo_supports_cbf:
+            raise ValueError("--cbf requires an algorithm with get_cbf (e.g., dec_share_cbf).")
         get_bb_cbf_fn_ = ft.partial(get_bb_cbf, algo.get_cbf, env, agent_id=args.cbf, x_dim=0, y_dim=1)
         get_bb_cbf_fn_ = jax_jit_np(get_bb_cbf_fn_)
 
@@ -358,7 +198,6 @@ def test(args):
             return Tb_x, Tb_y, Tbb_h
     else:
         get_bb_cbf_fn = None
-        cbf_fn = None
 
     use_recurrent_rollout = bool(algo is not None and getattr(algo, "use_gru", False) and hasattr(algo, "act_rnn"))
     use_nojit_rollout = bool(args.nojit_rollout and not use_recurrent_rollout)
@@ -584,7 +423,7 @@ def test(args):
 
 
 def main():
-    # Running Example: python test.py --path "pretrained/DubinsCar/gcbf+" --epi 5 --area-size 4 -n 16 --obs 0
+    # Running Example: python test.py --path "logs/RobotPedEnv/ppo/seed0_xxx" --epi 5 --area-size 12 -n 1 --obs 8
     parser = argparse.ArgumentParser()
     parser.add_argument("-n", "--num-agents", type=int, default=None)
     parser.add_argument("--obs", type=int, default=None)
@@ -600,8 +439,8 @@ def main():
     parser.add_argument("--debug", action="store_true", default=False)
     parser.add_argument("--cpu", action="store_true", default=False)
     parser.add_argument("--u-ref", action="store_true", default=False)
-    parser.add_argument("--env", type=str, default=None)
-    parser.add_argument("--algo", type=str, default=None)
+    parser.add_argument("--env", type=str, default="RobotPedEnv", choices=["RobotPedEnv"])
+    parser.add_argument("--algo", type=str, default="ppo", choices=["ppo", "dec_share_cbf"])
     parser.add_argument("--step", type=int, default=None)
     parser.add_argument("--epi", type=int, default=5) #  number of episodes to test
     parser.add_argument("--offset", type=int, default=0)

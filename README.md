@@ -36,7 +36,7 @@ pip install -e .
 
 ### Hyper-parameters
 
-To reproduce the results shown in our paper, one can refer to [`settings.yaml`](./settings.yaml).
+Use `python train.py --help` to view the current supported training flags.
 
 ### Train
 
@@ -66,7 +66,7 @@ python train.py \
   --gnn-layers 1 \
   --train-cbf-filter \
   --anti-stuck-enable \
-  --curriculum-config configs/curriculum_robotped_metric.yaml
+  --curriculum-config configs/curriculum_robotped_metric.yaml \
   --use-gru
 ```
 
@@ -89,7 +89,7 @@ Quick reward sweep (train + test + rank):
 python sweep_reward.py --repo-dir . --steps 300 --eval-epi 50
 ```
 
-Synv wandb data
+Sync wandb data
 
 ```bash
 wandb: wandb sync logs/RobotPedEnv/ppo/seed0_20260224003826/wandb/offline-run-20260224_003826-xw8pf8m4
@@ -163,8 +163,8 @@ Note: `--steps` is still the total training steps, so it must be **greater** tha
 In our paper, we use 8 agents with 1000 training steps. The training logs will be saved in folder `./logs/<env>/<algo>/seed<seed>_<training-start-time>`. We also provide the following flags:
 
 - `-n`: number of agents
-- `--env`: environment, including `SingleIntegrator`, `DoubleIntegrator`, `DubinsCar`, `LinearDrone`, and `CrazyFlie`
-- `--algo`: algorithm, including `gcbf`, `gcbf+`
+- `--env`: environment, currently `RobotPedEnv`
+- `--algo`: algorithm, `ppo` or `dec_share_cbf`
 - `--seed`: random seed
 - `--steps`: number of training steps
 - `--name`: name of the experiment
@@ -182,17 +182,17 @@ In our paper, we use 8 agents with 1000 training steps. The training logs will b
 - `--resume-dir`: resume from a specific run directory
 - `--resume-step`: resume from a specific checkpoint step
 
-In addition, use the following flags to specify the hyper-parameters:
+In addition, use the following flags to specify hyper-parameters:
 
-- `--alpha`: GCBF alpha
-- `--horizon`: GCBF+ look forward horizon
-- `--lr-actor`: learning rate of the actor
-- `--lr-cbf`: learning rate of the CBF
-- `--loss-action-coef`: coefficient of the action loss
-- `--loss-h-dot-coef`: coefficient of the h_dot loss
-- `--loss-safe-coef`: coefficient of the safe loss
-- `--loss-unsafe-coef`: coefficient of the unsafe loss
-- `--buffer-size`: size of the replay buffer
+- `--alpha`: CBF alpha (for `dec_share_cbf`)
+- `--lr-actor`: learning rate of the policy network
+- `--lr-value`: learning rate of the value network
+- `--gamma`: PPO discount factor
+- `--gae-lambda`: PPO GAE lambda
+- `--clip-ratio`: PPO clip ratio
+- `--ppo-epochs`: PPO update epochs per rollout
+- `--minibatch-size`: PPO minibatch size
+- `--max-grad-norm`: PPO gradient clipping norm
 
 ### Test
 
@@ -216,7 +216,7 @@ This should report the safety rate, goal reaching rate, and success rate of the 
 - `--max-step`: maximum number of steps for each episode, increase this if you have a large environment
 - `--path`: path to the log folder
 - `--n-rays`: number of LiDAR rays
-- `--alpha`: CBF alpha, used in centralized CBF-QP and decentralized CBF-QP
+- `--alpha`: CBF alpha (used by `dec_share_cbf`)
 - `--max-travel`: maximum travel distance of agents
 - `--cbf`: plot the CBF contour of this agent, only support 2D environments
 - `--seed`: random seed
