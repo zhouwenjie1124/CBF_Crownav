@@ -15,6 +15,9 @@ from .plot import render_video
 from .utils import compute_inv_ttc, get_lidar, inside_obstacles, get_node_goal_rng
 from .ped_env_wrapper import PedEnvWrapper
 from .ped_sim import PedCBFController, ped_sfm_step, ped_cbf_step, ped_orca_step, build_ped_graph
+from .robot_dynamics import RobotDynamics
+from .path_planner import PathPlanner
+from .rewards import assemble_legacy_proactive, assemble_paper
 
 
 class RobotPedEnv(MultiAgentEnv):
@@ -182,8 +185,8 @@ class RobotPedEnv(MultiAgentEnv):
     ):
         assert num_agents == 1, "RobotPedEnv only supports a single robot."
         super().__init__(num_agents, area_size, max_step, max_travel, dt, params)
-        self._sync_action_accel_params()
-        self._validate_action_mode_params()
+        # RobotDynamics handles param syncing and validation (mutates self._params in-place)
+        self._dynamics = RobotDynamics(self._params)
         # Keep reward thresholds consistent with robot size
         self._params["g_m"] = self._params["car_radius"]
         self._params["d_r"] = self._params["car_radius"]
@@ -222,6 +225,8 @@ class RobotPedEnv(MultiAgentEnv):
             n_agents=1,
             alpha=1.0,
         )
+        # Path planner (A* + pure-pursuit lookahead)
+        self._path_planner = PathPlanner(self._params, self.area_size)
 
     @property
     def state_dim(self) -> int:
@@ -241,382 +246,46 @@ class RobotPedEnv(MultiAgentEnv):
     def action_dim(self) -> int:
         return 2  # a_w, a_v (angular/linear acceleration)
 
-    def _sync_action_accel_params(self) -> None:
-        # Keep legacy delta_* and new a_* action params in sync.
-        if "a_w_max" not in self._params and "delta_omega_max" in self._params:
-            self._params["a_w_max"] = self._params["delta_omega_max"]
-        if "a_v_max" not in self._params and "delta_v_max" in self._params:
-            self._params["a_v_max"] = self._params["delta_v_max"]
-        if "a_w_step" not in self._params and "delta_w_step" in self._params:
-            self._params["a_w_step"] = self._params["delta_w_step"]
-        if "a_v_step" not in self._params and "delta_v_step" in self._params:
-            self._params["a_v_step"] = self._params["delta_v_step"]
-        if "delta_omega_max" not in self._params and "a_w_max" in self._params:
-            self._params["delta_omega_max"] = self._params["a_w_max"]
-        if "delta_v_max" not in self._params and "a_v_max" in self._params:
-            self._params["delta_v_max"] = self._params["a_v_max"]
-        if "delta_w_step" not in self._params and "a_w_step" in self._params:
-            self._params["delta_w_step"] = self._params["a_w_step"]
-        if "delta_v_step" not in self._params and "a_v_step" in self._params:
-            self._params["delta_v_step"] = self._params["a_v_step"]
+    # ------------------------------------------------------------------
+    # Dynamics delegates (thin wrappers – logic lives in RobotDynamics)
+    # ------------------------------------------------------------------
 
     def _is_vw_command_mode(self) -> bool:
-        mode = self._params.get("action_mode", "discrete_delta")
-        return mode in {"continuous_vw", "discrete_vw_grid"}
+        return self._dynamics.is_vw_command_mode()
 
     def _get_vw_grid_bins(self) -> tuple[Array, Array]:
-        v_bins = jnp.asarray(self._params["vw_grid_v"], dtype=jnp.float32).reshape(-1)
-        w_bins = jnp.asarray(self._params["vw_grid_w"], dtype=jnp.float32).reshape(-1)
-        return v_bins, w_bins
+        return self._dynamics.get_vw_grid_bins()
 
-    def _validate_action_mode_params(self) -> None:
-        mode = self._params.get("action_mode", "discrete_delta")
-        valid_modes = {"discrete_delta", "continuous_vw", "discrete_vw_grid"}
-        if mode not in valid_modes:
-            raise ValueError(f"Unsupported action_mode '{mode}'. Expected one of {sorted(valid_modes)}.")
-        if mode != "discrete_vw_grid":
-            return
-
-        if "vw_grid_v" not in self._params or "vw_grid_w" not in self._params:
-            raise ValueError("discrete_vw_grid requires params 'vw_grid_v' and 'vw_grid_w'.")
-
-        v_bins = np.asarray(self._params["vw_grid_v"], dtype=np.float32).reshape(-1)
-        w_bins = np.asarray(self._params["vw_grid_w"], dtype=np.float32).reshape(-1)
-        if v_bins.size == 0 or w_bins.size == 0:
-            raise ValueError("vw_grid_v and vw_grid_w must be non-empty.")
-        if not np.all(np.isfinite(v_bins)) or not np.all(np.isfinite(w_bins)):
-            raise ValueError("vw_grid_v and vw_grid_w must contain finite values.")
-
-        # Canonicalize to sorted unique bins so index ordering is deterministic.
-        v_bins = np.unique(v_bins)
-        w_bins = np.unique(w_bins)
-
-        v_min, v_max = float(self._params["v_min"]), float(self._params["v_max"])
-        w_min, w_max = float(self._params["w_min"]), float(self._params["w_max"])
-        if np.any(v_bins < v_min) or np.any(v_bins > v_max):
-            raise ValueError(f"vw_grid_v values must be within [{v_min}, {v_max}].")
-        if np.any(w_bins < w_min) or np.any(w_bins > w_max):
-            raise ValueError(f"vw_grid_w values must be within [{w_min}, {w_max}].")
-
-        self._params["vw_grid_v"] = v_bins.tolist()
-        self._params["vw_grid_w"] = w_bins.tolist()
-        self._params["action_discrete"] = True
+    # ------------------------------------------------------------------
+    # Path planning delegates (thin wrappers – logic lives in PathPlanner)
+    # ------------------------------------------------------------------
 
     def _empty_path_plan(self, goal_xy: Array) -> tuple[Array, Array, Array]:
-        max_wp = int(self._params.get("path_max_waypoints", 128))
-        waypoints = jnp.zeros((max_wp, 2), dtype=jnp.float32)
-        valid = jnp.zeros((max_wp,), dtype=bool)
-        use_fallback = bool(self._params.get("astar_fallback_to_goal", True))
-        if use_fallback:
-            waypoints = waypoints.at[0].set(goal_xy)
-            valid = valid.at[0].set(True)
-            path_len = jnp.array([1], dtype=jnp.int32)
-        else:
-            path_len = jnp.array([0], dtype=jnp.int32)
-        return waypoints, valid, path_len
+        return self._path_planner.empty_plan(goal_xy)
 
-    def _plan_path_astar(
-        self,
-        obstacles: Obstacle,
-        start_xy: Array,
-        goal_xy: Array,
-    ) -> tuple[Array, Array, Array]:
-        grid_size = int(self._params.get("astar_grid_size", 64))
-        max_expand = int(self._params.get("astar_max_expand", 4096))
-        max_wp = int(self._params.get("path_max_waypoints", 128))
-        allow_diag = bool(self._params.get("astar_allow_diag", True))
-        n_nodes = grid_size * grid_size
-        cell_size = float(self.area_size) / float(grid_size)
+    def _plan_path_astar(self, obstacles, start_xy, goal_xy):
+        return self._path_planner.plan(obstacles, start_xy, goal_xy)
 
-        grid = jnp.arange(grid_size, dtype=jnp.float32)
-        centers_1d = (grid + 0.5) * cell_size
-        xs, ys = jnp.meshgrid(centers_1d, centers_1d, indexing="xy")
-        centers = jnp.stack([xs.reshape(-1), ys.reshape(-1)], axis=-1)
+    def _compute_lookahead_distance(self, v_abs):
+        return self._path_planner.lookahead_dist(v_abs)
 
-        start_ix = jnp.clip(jnp.floor(start_xy[0] / cell_size).astype(jnp.int32), 0, grid_size - 1)
-        start_iy = jnp.clip(jnp.floor(start_xy[1] / cell_size).astype(jnp.int32), 0, grid_size - 1)
-        goal_ix = jnp.clip(jnp.floor(goal_xy[0] / cell_size).astype(jnp.int32), 0, grid_size - 1)
-        goal_iy = jnp.clip(jnp.floor(goal_xy[1] / cell_size).astype(jnp.int32), 0, grid_size - 1)
-        start_idx = start_iy * grid_size + start_ix
-        goal_idx = goal_iy * grid_size + goal_ix
+    def _compute_path_projection_s(self, path_waypoints, path_len, agent_xy):
+        return self._path_planner.project(path_waypoints, path_len, agent_xy)
 
-        occ = inside_obstacles(centers, obstacles, r=float(self._params["car_radius"]))
-        occ = occ.at[start_idx].set(False)
-        occ = occ.at[goal_idx].set(False)
+    def _interp_path_at_s(self, path_waypoints, path_len, s_query):
+        return self._path_planner.interpolate(path_waypoints, path_len, s_query)
 
-        dx = jnp.array([1, -1, 0, 0, 1, 1, -1, -1], dtype=jnp.int32)
-        dy = jnp.array([0, 0, 1, -1, 1, -1, 1, -1], dtype=jnp.int32)
-        dcost = jnp.array(
-            [1.0, 1.0, 1.0, 1.0, np.sqrt(2.0), np.sqrt(2.0), np.sqrt(2.0), np.sqrt(2.0)],
-            dtype=jnp.float32,
-        )
-        diag = jnp.array([False, False, False, False, True, True, True, True])
-        move_mask = jnp.where(diag, jnp.array(allow_diag), jnp.array(True))
-
-        g_goal = centers[goal_idx]
-        h = jnp.linalg.norm(centers - g_goal[None, :], axis=-1)
-        inf = jnp.array(1e9, dtype=jnp.float32)
-        g = jnp.full((n_nodes,), inf, dtype=jnp.float32)
-        f = jnp.full((n_nodes,), inf, dtype=jnp.float32)
-        parent = jnp.full((n_nodes,), -1, dtype=jnp.int32)
-        open_mask = jnp.zeros((n_nodes,), dtype=bool)
-        closed_mask = jnp.zeros((n_nodes,), dtype=bool)
-
-        g = g.at[start_idx].set(0.0)
-        f = f.at[start_idx].set(h[start_idx])
-        parent = parent.at[start_idx].set(start_idx)
-        open_mask = open_mask.at[start_idx].set(True)
-
-        def expand_neighbor(ii, carry):
-            g_i, f_i, p_i, o_i, current, cx, cy, g_cur, closed_cur = carry
-            nx = cx + dx[ii]
-            ny = cy + dy[ii]
-            in_bounds = (nx >= 0) & (nx < grid_size) & (ny >= 0) & (ny < grid_size)
-            nb = ny * grid_size + nx
-            nb = jnp.clip(nb, 0, n_nodes - 1)
-            active = in_bounds & move_mask[ii] & (~occ[nb]) & (~closed_cur[nb])
-            cand_g = g_cur + dcost[ii]
-            better = cand_g < g_i[nb]
-            do_update = active & better
-            g_i = g_i.at[nb].set(jnp.where(do_update, cand_g, g_i[nb]))
-            f_i = f_i.at[nb].set(jnp.where(do_update, cand_g + h[nb], f_i[nb]))
-            p_i = p_i.at[nb].set(jnp.where(do_update, current, p_i[nb]))
-            o_i = o_i.at[nb].set(jnp.where(do_update, True, o_i[nb]))
-            return g_i, f_i, p_i, o_i, current, cx, cy, g_cur, closed_cur
-
-        def search_iter(_, carry):
-            g_i, f_i, p_i, o_i, c_i, found_i, done_i = carry
-
-            def do_search(carry_inner):
-                g_s, f_s, p_s, o_s, c_s, found_s, _ = carry_inner
-                masked_f = jnp.where(o_s, f_s, inf)
-                current = jnp.argmin(masked_f)
-                has_open = jnp.logical_and(o_s[current], masked_f[current] < inf)
-
-                def no_open(_):
-                    return g_s, f_s, p_s, o_s, c_s, found_s, jnp.array(True)
-
-                def expand_open(_):
-                    o_n = o_s.at[current].set(False)
-                    c_n = c_s.at[current].set(True)
-                    reached = current == goal_idx
-
-                    def done_goal(_):
-                        return g_s, f_s, p_s, o_n, c_n, jnp.array(True), jnp.array(True)
-
-                    def do_expand(_):
-                        cx = current % grid_size
-                        cy = current // grid_size
-                        g_cur = g_s[current]
-                        g_n, f_n, p_n, o_n2, _, _, _, _, _ = jax.lax.fori_loop(
-                            0, 8, expand_neighbor, (g_s, f_s, p_s, o_n, current, cx, cy, g_cur, c_n)
-                        )
-                        return g_n, f_n, p_n, o_n2, c_n, jnp.array(False), jnp.array(False)
-
-                    return jax.lax.cond(reached, done_goal, do_expand, operand=None)
-
-                return jax.lax.cond(has_open, expand_open, no_open, operand=None)
-
-            return jax.lax.cond(done_i, lambda x: x, do_search, carry)
-
-        g, f, parent, open_mask, closed_mask, found, _ = jax.lax.fori_loop(
-            0,
-            max_expand,
-            search_iter,
-            (g, f, parent, open_mask, closed_mask, jnp.array(False), jnp.array(False)),
-        )
-
-        def build_path(_):
-            rev_nodes = jnp.full((max_wp,), start_idx, dtype=jnp.int32)
-
-            def backtrack(i, carry):
-                nodes_i, cur_i, length_i, done_i = carry
-                nodes_i = nodes_i.at[i].set(jnp.where(done_i, nodes_i[i], cur_i))
-                length_i = jnp.where(done_i, length_i, length_i + 1)
-                reached = cur_i == start_idx
-                parent_i = parent[cur_i]
-                cur_next = jnp.where(jnp.logical_or(done_i, reached), cur_i, parent_i)
-                done_next = jnp.logical_or(done_i, reached)
-                return nodes_i, cur_next, length_i, done_next
-
-            rev_nodes, _, valid_len, _ = jax.lax.fori_loop(
-                0, max_wp, backtrack, (rev_nodes, goal_idx, jnp.array(0, dtype=jnp.int32), jnp.array(False))
-            )
-            idx = jnp.arange(max_wp, dtype=jnp.int32)
-            read_idx = jnp.clip(valid_len - 1 - idx, 0, max_wp - 1)
-            path_nodes = rev_nodes[read_idx]
-            valid = idx < valid_len
-            waypoints = centers[path_nodes]
-            waypoints = jnp.where(valid[:, None], waypoints, jnp.zeros_like(waypoints))
-            last = jnp.maximum(valid_len - 1, 0)
-            waypoints = waypoints.at[last].set(goal_xy)
-            path_len = jnp.array([valid_len], dtype=jnp.int32)
-            return waypoints, valid, path_len
-
-        return jax.lax.cond(found, build_path, lambda _: self._empty_path_plan(goal_xy), operand=None)
-
-    def _compute_lookahead_distance(self, v_abs: Array) -> Array:
-        l0 = float(self._params.get("lookahead_l0", 0.8))
-        kv = float(self._params.get("lookahead_kv", 1.2))
-        lmin = float(self._params.get("lookahead_min", 0.8))
-        lmax = float(self._params.get("lookahead_max", 3.0))
-        return jnp.clip(kv * v_abs + l0, a_min=lmin, a_max=lmax)
-
-    def _compute_path_projection_s(
-        self,
-        path_waypoints: Array,
-        path_len: Array,
-        agent_xy: Array,
-    ) -> tuple[Array, Array, Array, Array]:
-        eps = float(self._params.get("lookahead_eps", 1e-6))
-        pos = agent_xy[0] if agent_xy.ndim == 2 else agent_xy
-        n_pts = path_len.squeeze().astype(jnp.int32)
-        n_seg = jnp.maximum(n_pts - 1, 0)
-        max_seg = path_waypoints.shape[0] - 1
-        seg_idx = jnp.arange(max_seg, dtype=jnp.int32)
-        active = seg_idx < n_seg
-
-        p0 = path_waypoints[:max_seg]
-        p1 = path_waypoints[1:max_seg + 1]
-        d = p1 - p0
-        len2 = jnp.sum(d * d, axis=-1)
-        seg_len = jnp.sqrt(jnp.maximum(len2, 0.0))
-
-        rel = pos[None, :] - p0
-        denom = jnp.where(len2 > eps, len2, 1.0)
-        t = jnp.clip(jnp.sum(rel * d, axis=-1) / denom, 0.0, 1.0)
-        t = jnp.where(active, t, 0.0)
-        proj = p0 + t[:, None] * d
-
-        dist2 = jnp.sum((proj - pos[None, :]) ** 2, axis=-1)
-        dist2 = jnp.where(active, dist2, jnp.inf)
-        best_idx = jnp.argmin(dist2)
-        has_seg = n_seg > 0
-
-        seg_len_masked = jnp.where(active, seg_len, 0.0)
-        prefix_end = jnp.cumsum(seg_len_masked)
-        prefix_start = prefix_end - seg_len_masked
-        total_len = prefix_end[-1] if max_seg > 0 else jnp.array(0.0, dtype=jnp.float32)
-
-        s_star = jnp.where(
-            has_seg,
-            prefix_start[best_idx] + t[best_idx] * seg_len[best_idx],
-            jnp.array(0.0, dtype=jnp.float32),
-        )
-        proj_xy = jnp.where(
-            has_seg,
-            proj[best_idx],
-            jnp.where(n_pts > 0, path_waypoints[0], pos),
-        )
-        seg_out = jnp.where(has_seg, best_idx, jnp.array(0, dtype=jnp.int32))
-        return s_star, seg_out, proj_xy, total_len
-
-    def _interp_path_at_s(self, path_waypoints: Array, path_len: Array, s_query: Array) -> Array:
-        eps = float(self._params.get("lookahead_eps", 1e-6))
-        n_pts = path_len.squeeze().astype(jnp.int32)
-        max_seg = path_waypoints.shape[0] - 1
-        n_seg = jnp.maximum(n_pts - 1, 0)
-        seg_idx = jnp.arange(max_seg, dtype=jnp.int32)
-        active = seg_idx < n_seg
-
-        p0 = path_waypoints[:max_seg]
-        p1 = path_waypoints[1:max_seg + 1]
-        d = p1 - p0
-        seg_len = jnp.linalg.norm(d, axis=-1)
-        seg_len_masked = jnp.where(active, seg_len, 0.0)
-        prefix_end = jnp.cumsum(seg_len_masked)
-        prefix_start = prefix_end - seg_len_masked
-        total_len = prefix_end[-1] if max_seg > 0 else jnp.array(0.0, dtype=jnp.float32)
-        s = jnp.clip(s_query, a_min=0.0, a_max=total_len)
-
-        resid = s - prefix_start
-        clamped = jnp.clip(resid, a_min=0.0, a_max=seg_len)
-        err = jnp.abs(resid - clamped)
-        err = jnp.where(active, err, jnp.inf)
-        best_idx = jnp.argmin(err)
-        has_seg = n_seg > 0
-        ratio = jnp.where(seg_len[best_idx] > eps, clamped[best_idx] / seg_len[best_idx], 0.0)
-        seg_target = p0[best_idx] + ratio * d[best_idx]
-        target = jnp.where(
-            has_seg,
-            seg_target,
-            jnp.where(n_pts > 0, path_waypoints[0], jnp.zeros((2,), dtype=jnp.float32)),
-        )
-        return target
-
-    def _lookahead_target_from_state(
-        self,
-        env_state: EnvState,
-        agent_states: AgentState,
-    ) -> tuple[Array, dict]:
-        goal_xy = env_state.goal[0, :2]
-        use_path = bool(self._params.get("path_reward_enable", True))
-        use_lookahead = bool(self._params.get("lookahead_enable", True))
-        path_len_scalar = env_state.path_len.squeeze().astype(jnp.int32)
-        path_available = jnp.logical_and(jnp.array(use_path), path_len_scalar > 0)
-        do_lookahead = jnp.logical_and(path_available, jnp.array(use_lookahead))
-
-        pos = agent_states[0, :2]
-        v_abs = jnp.abs(agent_states[0, 3])
-        ld = self._compute_lookahead_distance(v_abs)
-
-        s_star, seg_idx, proj_xy, total_len = self._compute_path_projection_s(
+    def _lookahead_target_from_state(self, env_state, agent_states):
+        return self._path_planner.get_target(
             env_state.path_waypoints,
             env_state.path_len,
-            pos,
+            env_state.goal[0, :2],
+            agent_states,
         )
-        s_goal = jnp.clip(s_star + ld, a_min=0.0, a_max=total_len)
-        lookahead_xy = self._interp_path_at_s(env_state.path_waypoints, env_state.path_len, s_goal)
-        target_xy = jnp.where(do_lookahead, lookahead_xy, goal_xy)
 
-        dbg = {
-            "lookahead_ld": ld.astype(jnp.float32),
-            "lookahead_s_star": s_star.astype(jnp.float32),
-            "lookahead_s_goal": s_goal.astype(jnp.float32),
-            "lookahead_path_len_m": total_len.astype(jnp.float32),
-            "lookahead_proj_dist": jnp.linalg.norm(pos - proj_xy).astype(jnp.float32),
-            "lookahead_target_dist": jnp.linalg.norm(pos - target_xy).astype(jnp.float32),
-            "lookahead_seg_idx": seg_idx.astype(jnp.float32),
-            "lookahead_active": do_lookahead.astype(jnp.float32),
-        }
-        return target_xy, dbg
-
-    def _advance_subgoal_idx(
-        self,
-        path_waypoints: Array,
-        path_len: Array,
-        subgoal_idx: Array,
-        agent_xy: Array,
-    ) -> Array:
-        path_len_scalar = path_len.squeeze().astype(jnp.int32)
-        max_idx = jnp.maximum(path_len_scalar - 1, 0)
-        idx0 = jnp.clip(subgoal_idx.squeeze().astype(jnp.int32), 0, max_idx)
-        if not bool(self._params.get("path_reward_enable", True)):
-            return idx0
-        if path_waypoints.shape[0] == 0:
-            return idx0
-        # Deprecated: kept only for backward compatibility of utility tests.
-        reach_radius = 0.35
-        n_iter = int(self._params.get("path_max_waypoints", 128))
-        pos = agent_xy[0] if agent_xy.ndim == 2 else agent_xy
-
-        def one_step(_, idx_i):
-            sg = path_waypoints[jnp.clip(idx_i, 0, max_idx)]
-            dist = jnp.linalg.norm(pos - sg)
-            can_advance = (dist <= reach_radius) & (idx_i < max_idx)
-            return jnp.where(can_advance, idx_i + 1, idx_i)
-
-        return jax.lax.fori_loop(0, n_iter, one_step, idx0)
-
-    def _heading_target_from_state(
-        self,
-        env_state: EnvState,
-        agent_states: AgentState,
-        advance: bool = True,
-    ) -> tuple[Array, Array]:
+    def _heading_target_from_state(self, env_state, agent_states, advance=True):
         del advance
         target, _ = self._lookahead_target_from_state(env_state, agent_states)
-        # Keep subgoal_idx API for compatibility; fixed to 0 in lookahead mode.
         return target, jnp.array(0, dtype=jnp.int32)
 
     def reset(self, key: Array) -> GraphsTuple:
@@ -1077,6 +746,29 @@ class RobotPedEnv(MultiAgentEnv):
         }
         return r_stuck, next_count, info
 
+    # ------------------------------------------------------------------
+    # Reward computation – delegates to higcbf/env/rewards.py
+    # ------------------------------------------------------------------
+
+    def _get_lidar_dist(self, graph: EnvGraphsTuple) -> Array:
+        """Helper: get per-ray distance from robot to lidar hit."""
+        agent_pos = graph.type_states(type_idx=0, n_type=1)[:, :2]
+        lidar = get_lidar(agent_pos[0], graph.env_states.obstacle,
+                          self._params["n_rays"], self._params["comm_radius"])
+        return jnp.linalg.norm(lidar - agent_pos[0], axis=-1)
+
+    def _get_theta_d(self, graph: EnvGraphsTuple, next_agent_states: AgentState) -> Array | None:
+        """Helper: compute desired heading angle (None if heading reward disabled)."""
+        if not bool(self._params.get("heading_reward", False)):
+            return None
+        agent_states = graph.type_states(type_idx=0, n_type=1)
+        ped_states = graph.type_states(type_idx=2, n_type=self._params["n_ped"])
+        target_xy, _ = self._heading_target_from_state(graph.env_states, next_agent_states)
+        return self._desired_heading_angle(
+            agent_states, graph.env_states.goal, ped_states,
+            graph.env_states.obstacle, target_pos=target_xy[None, :]
+        )
+
     def _compute_reward_terms_selected(
         self,
         graph: EnvGraphsTuple,
@@ -1084,298 +776,47 @@ class RobotPedEnv(MultiAgentEnv):
         action: Action,
         collision_obs_attempt: Array | None = None,
     ) -> dict:
-        reward_mode = str(self._params.get("reward_mode", "legacy")).lower()
-        if reward_mode == "legacy":
-            return self._compute_reward_legacy_terms(graph, next_agent_states, action, collision_obs_attempt)
-        if reward_mode == "proactive":
-            return self._compute_reward_proactive_terms(graph, next_agent_states, action, collision_obs_attempt)
+        reward_mode = str(self._params.get("reward_mode", "proactive")).lower()
+        agent_states = graph.type_states(type_idx=0, n_type=1)
+        agent_pos = agent_states[:, :2]
+        goal_pos = graph.env_states.goal[:, :2]
+        ped_states = graph.type_states(type_idx=2, n_type=self._params["n_ped"])
+        ped_pos = ped_states[:, :2]
+        is_timeout = jnp.array(self._t >= self.max_episode_steps)
+        lidar_dist = self._get_lidar_dist(graph)
+        theta_d = self._get_theta_d(graph, next_agent_states)
+
         if reward_mode == "paper":
-            return self._compute_reward2_terms(graph, next_agent_states, action, collision_obs_attempt)
-        raise ValueError(f"Unknown reward_mode: {reward_mode}. Expected one of ['legacy', 'proactive', 'paper'].")
-
-    def _compute_reward_legacy_terms(
-        self,
-        graph: EnvGraphsTuple,
-        next_agent_states: AgentState,
-        action: Action,
-        collision_obs_attempt: Array | None = None,
-    ) -> dict:
-        agent_states = graph.type_states(type_idx=0, n_type=1)
-        agent_pos = agent_states[:, :2]
-        goal_pos = graph.env_states.goal[:, :2]
-        ped_states = graph.type_states(type_idx=2, n_type=self._params["n_ped"])
-        ped_pos = ped_states[:, :2]
-        timeout = jnp.array(self._t >= self.max_episode_steps)
-        timeout_penalty = float(self._params.get("kappa_timeout", -15.0))
-
-        d_prev = jnp.linalg.norm(agent_pos - goal_pos, axis=-1)
-        d_next = jnp.linalg.norm(next_agent_states[:, :2] - goal_pos, axis=-1)
-
-        # clearance to pedestrians
-        ped_clear_all = jnp.full((1, 0), jnp.inf)
-        if ped_pos.shape[0] > 0:
-            ped_dist = jnp.linalg.norm(agent_pos[:, None, :] - ped_pos[None, :, :], axis=-1)
-            ped_clear_all = ped_dist - (self._params["car_radius"] + self._params["ped_radius"])
-
-        # clearance to obstacles via lidar hits
-        lidar = get_lidar(
-            agent_pos[0, :],
-            graph.env_states.obstacle,
-            self._params["n_rays"],
-            self._params["comm_radius"],
+            return assemble_paper(
+                agent_pos=agent_pos,
+                agent_states=agent_states,
+                next_agent_states=next_agent_states,
+                goal_pos=goal_pos,
+                ped_pos=ped_pos,
+                lidar_dist=lidar_dist,
+                is_timeout=is_timeout,
+                collision_obs_attempt=collision_obs_attempt,
+                theta_d=theta_d,
+                params=self._params,
+            )
+        proactive = (reward_mode == "proactive")
+        return assemble_legacy_proactive(
+            agent_pos=agent_pos,
+            agent_states=agent_states,
+            next_agent_states=next_agent_states,
+            goal_pos=goal_pos,
+            ped_pos=ped_pos,
+            ped_states=ped_states,
+            lidar_dist=lidar_dist,
+            action=action,
+            dt=self.dt,
+            is_timeout=is_timeout,
+            collision_obs_attempt=collision_obs_attempt,
+            theta_d=theta_d,
+            inv_ttc_fn=self._compute_inv_ttc,
+            params=self._params,
+            proactive=proactive,
         )
-        lidar_dist = jnp.linalg.norm(lidar - agent_pos[0, :], axis=-1)
-        obs_clear_all = (lidar_dist - self._params["car_radius"])[None, :]
-        goal_tol = self._params["goal_tolerance"]
-        safety_margin = self._params["safety_margin"]
-
-        any_ped_collision = (ped_clear_all <= 0.0).any(axis=1)
-        any_obs_collision = (obs_clear_all <= 0.0).any(axis=1)
-        if collision_obs_attempt is not None:
-            any_obs_collision = jnp.logical_or(any_obs_collision, collision_obs_attempt)
-        any_collision = jnp.logical_or(any_ped_collision, any_obs_collision)
-        ped_close = ped_clear_all < safety_margin
-        obs_close = obs_clear_all < safety_margin
-        any_close = jnp.logical_or(ped_close.any(axis=1), obs_close.any(axis=1))
-        safe_mode = self._params.get("safe_penalty_mode", "sum")
-        if safe_mode == "min":
-            all_clear = jnp.concatenate([ped_clear_all, obs_clear_all], axis=1)
-            min_clear = jnp.min(all_clear, axis=1)
-            safe_penalty = jnp.where(any_close, min_clear - safety_margin, 0.0)
-        else:
-            safe_penalty = (
-                jnp.where(ped_close, ped_clear_all - safety_margin, 0.0).sum(axis=1)
-                + jnp.where(obs_close, obs_clear_all - safety_margin, 0.0).sum(axis=1)
-            )
-
-        r_progress = self._params["kappa_prog"] * (d_prev - d_next)
-        r_safe = self._params["kappa_safe"] * safe_penalty
-        # Keep progress shaping active even near obstacles, then add safety penalty.
-        # Only goal/collision should override this dense shaping term.
-        r_task = jnp.where(
-            d_next <= goal_tol,
-            self._params["kappa_succ"],
-            jnp.where(
-                any_collision,
-                self._params["kappa_col"],
-                r_progress + r_safe,
-            ),
-        )
-
-        if self._params.get("heading_reward", False):
-            target_xy, _ = self._heading_target_from_state(
-                graph.env_states, next_agent_states, advance=True
-            )
-            theta_d = self._desired_heading_angle(
-                next_agent_states,
-                graph.env_states.goal,
-                ped_states,
-                graph.env_states.obstacle,
-                target_pos=target_xy[None, :],
-            )
-            theta_m = float(self._params.get("heading_theta_m", np.pi / 6))
-            r_angle = float(self._params.get("heading_r_angle", 0.6))
-            r_heading = r_angle * jnp.clip(theta_m - jnp.abs(theta_d), a_min=0.0, a_max=None)
-            r_task = r_task + r_heading
-        else:
-            r_heading = jnp.zeros_like(r_task)
-
-        agent_vel = jnp.concatenate(
-            [
-                (agent_states[:, 3] * jnp.cos(agent_states[:, 2]))[:, None],
-                (agent_states[:, 3] * jnp.sin(agent_states[:, 2]))[:, None],
-            ],
-            axis=-1,
-        )
-        ped_vel = ped_states[:, 2:4]
-        rel_pos = ped_pos[None, :, :] - agent_pos[:, None, :]
-        rel_vel = ped_vel[None, :, :] - agent_vel[:, None, :]
-        r_sum = self._params["car_radius"] + self._params["ped_radius"]
-        inv_ttc = self._compute_inv_ttc(rel_pos, rel_vel, r_sum)
-        ttc = jnp.where(inv_ttc > 0.0, 1.0 / (inv_ttc + self._params["ttc_eps"]), jnp.inf)
-        ttc_mask = ttc < self._params["ttc_threshold"]
-        r_risk = (
-            ttc_mask * (self._params["kappa_ttc"] + self._params["kappa_inv"] / (ttc + self._params["ttc_eps"]))
-        ).sum(axis=1)
-
-        r_main = r_task
-
-        delta_v = action[:, 1] * self.dt
-        delta_w = action[:, 0] * self.dt
-        omega = agent_states[:, 4]
-        r_smooth = -self._params["kappa_delta"] * (
-            delta_v ** 2 + self._params["lambda_omega"] * delta_w ** 2
-        ) - self._params["kappa_omega"] * (omega ** 2)
-        r_time = -self._params["kappa_time"] * jnp.ones_like(r_main)
-        reward = r_main + r_time + r_smooth  # + r_risk
-        reward = jnp.where(timeout, timeout_penalty * jnp.ones_like(reward), reward)
-        r_timeout = jnp.where(timeout, timeout_penalty, 0.0) * jnp.ones_like(r_main)
-        return {
-            "reward": reward.squeeze(),
-            "r_main": r_main.squeeze(),
-            "r_task": r_task.squeeze(),
-            "r_progress": r_progress.squeeze(),
-            "r_safe": r_safe.squeeze(),
-            "r_heading": r_heading.squeeze(),
-            "r_risk": r_risk.squeeze(),
-            "r_time": r_time.squeeze(),
-            "r_smooth": r_smooth.squeeze(),
-            "r_timeout": r_timeout.squeeze(),
-            "safe_penalty": safe_penalty.squeeze(),
-            "d_prev": d_prev.squeeze(),
-            "d_next": d_next.squeeze(),
-            "timeout": timeout.astype(jnp.float32).squeeze(),
-            "any_collision": any_collision.astype(jnp.float32).squeeze(),
-        }
-
-    def _compute_reward_proactive_terms(
-        self,
-        graph: EnvGraphsTuple,
-        next_agent_states: AgentState,
-        action: Action,
-        collision_obs_attempt: Array | None = None,
-    ) -> dict:
-        agent_states = graph.type_states(type_idx=0, n_type=1)
-        agent_pos = agent_states[:, :2]
-        goal_pos = graph.env_states.goal[:, :2]
-        ped_states = graph.type_states(type_idx=2, n_type=self._params["n_ped"])
-        ped_pos = ped_states[:, :2]
-        timeout = jnp.array(self._t >= self.max_episode_steps)
-        timeout_penalty = float(self._params.get("kappa_timeout", -15.0))
-
-        d_prev = jnp.linalg.norm(agent_pos - goal_pos, axis=-1)
-        d_next = jnp.linalg.norm(next_agent_states[:, :2] - goal_pos, axis=-1)
-
-        # clearance to pedestrians
-        ped_clear_all = jnp.full((1, 0), jnp.inf)
-        if ped_pos.shape[0] > 0:
-            ped_dist = jnp.linalg.norm(agent_pos[:, None, :] - ped_pos[None, :, :], axis=-1)
-            ped_clear_all = ped_dist - (self._params["car_radius"] + self._params["ped_radius"])
-
-        # clearance to obstacles via lidar hits
-        lidar = get_lidar(
-            agent_pos[0, :],
-            graph.env_states.obstacle,
-            self._params["n_rays"],
-            self._params["comm_radius"],
-        )
-        lidar_dist = jnp.linalg.norm(lidar - agent_pos[0, :], axis=-1)
-        obs_clear_all = (lidar_dist - self._params["car_radius"])[None, :]
-        goal_tol = self._params["goal_tolerance"]
-        safety_margin = self._params["safety_margin"]
-
-        any_ped_collision = (ped_clear_all <= 0.0).any(axis=1)
-        any_obs_collision = (obs_clear_all <= 0.0).any(axis=1)
-        if collision_obs_attempt is not None:
-            any_obs_collision = jnp.logical_or(any_obs_collision, collision_obs_attempt)
-        any_collision = jnp.logical_or(any_ped_collision, any_obs_collision)
-        ped_close = ped_clear_all < safety_margin
-        obs_close = obs_clear_all < safety_margin
-        any_close = jnp.logical_or(ped_close.any(axis=1), obs_close.any(axis=1))
-        safe_mode = self._params.get("safe_penalty_mode", "sum")
-        if safe_mode == "min":
-            all_clear = jnp.concatenate([ped_clear_all, obs_clear_all], axis=1)
-            min_clear = jnp.min(all_clear, axis=1)
-            safe_penalty = jnp.where(any_close, min_clear - safety_margin, 0.0)
-        else:
-            safe_penalty = (
-                jnp.where(ped_close, ped_clear_all - safety_margin, 0.0).sum(axis=1)
-                + jnp.where(obs_close, obs_clear_all - safety_margin, 0.0).sum(axis=1)
-            )
-
-        r_progress = self._params["kappa_prog"] * (d_prev - d_next)
-        r_safe = self._params["kappa_safe"] * safe_penalty
-        # Keep progress shaping active even near obstacles, then add safety penalty.
-        # Only goal/collision should override this dense shaping term.
-        r_task = jnp.where(
-            d_next <= goal_tol,
-            self._params["kappa_succ"],
-            jnp.where(
-                any_collision,
-                self._params["kappa_col"],
-                r_progress + r_safe,
-            ),
-        )
-
-        if self._params.get("heading_reward", False):
-            target_xy, _ = self._heading_target_from_state(
-                graph.env_states, next_agent_states, advance=True
-            )
-            theta_d = self._desired_heading_angle(
-                next_agent_states,
-                graph.env_states.goal,
-                ped_states,
-                graph.env_states.obstacle,
-                target_pos=target_xy[None, :],
-            )
-            theta_m = float(self._params.get("heading_theta_m", np.pi / 6))
-            r_angle = float(self._params.get("heading_r_angle", 0.6))
-            heading_base = r_angle * jnp.clip(theta_m - jnp.abs(theta_d), a_min=0.0, a_max=None)
-            progress = d_prev - d_next
-            speed_eps = float(self._params.get("anti_stuck_speed_eps", 0.05))
-            progress_eps = float(self._params.get("anti_stuck_progress_eps", 0.01))
-            speed_gate = jnp.clip(
-                (jnp.abs(next_agent_states[:, 3]) - speed_eps) / (float(self._params["v_max"]) - speed_eps + 1e-6),
-                a_min=0.0,
-                a_max=1.0,
-            )
-            progress_gate = (progress > progress_eps).astype(jnp.float32)
-            heading_gate = speed_gate * progress_gate
-            r_heading = heading_base * heading_gate
-            r_task = r_task + r_heading
-        else:
-            r_heading = jnp.zeros_like(r_task)
-
-        if ped_pos.shape[0] > 0:
-            agent_vel = jnp.concatenate(
-                [
-                    (agent_states[:, 3] * jnp.cos(agent_states[:, 2]))[:, None],
-                    (agent_states[:, 3] * jnp.sin(agent_states[:, 2]))[:, None],
-                ],
-                axis=-1,
-            )
-            ped_vel = ped_states[:, 2:4]
-            rel_pos = ped_pos[None, :, :] - agent_pos[:, None, :]
-            rel_vel = ped_vel[None, :, :] - agent_vel[:, None, :]
-            r_sum = self._params["car_radius"] + self._params["ped_radius"]
-            inv_ttc = self._compute_inv_ttc(rel_pos, rel_vel, r_sum)
-            ttc = jnp.where(inv_ttc > 0.0, 1.0 / (inv_ttc + self._params["ttc_eps"]), jnp.inf)
-            ttc_mask = ttc < self._params["ttc_threshold"]
-            r_risk = (
-                ttc_mask * (self._params["kappa_ttc"] + self._params["kappa_inv"] / (ttc + self._params["ttc_eps"]))
-            ).sum(axis=1)
-        else:
-            r_risk = jnp.zeros_like(r_task)
-
-        # Include short-horizon collision risk so the policy learns proactive avoidance.
-        r_main = r_task + r_risk
-
-        delta_v = action[:, 1] * self.dt
-        delta_w = action[:, 0] * self.dt
-        omega = agent_states[:, 4]
-        r_smooth = -self._params["kappa_delta"] * (
-            delta_v ** 2 + self._params["lambda_omega"] * delta_w ** 2
-        ) - self._params["kappa_omega"] * (omega ** 2)
-        r_time = -self._params["kappa_time"] * jnp.ones_like(r_main)
-        r_timeout = jnp.where(timeout, timeout_penalty, 0.0) * jnp.ones_like(r_main)
-        reward = r_main + r_time + r_smooth + r_timeout
-        return {
-            "reward": reward.squeeze(),
-            "r_main": r_main.squeeze(),
-            "r_task": r_task.squeeze(),
-            "r_progress": r_progress.squeeze(),
-            "r_safe": r_safe.squeeze(),
-            "r_heading": r_heading.squeeze(),
-            "r_risk": r_risk.squeeze(),
-            "r_time": r_time.squeeze(),
-            "r_smooth": r_smooth.squeeze(),
-            "r_timeout": r_timeout.squeeze(),
-            "safe_penalty": safe_penalty.squeeze(),
-            "d_prev": d_prev.squeeze(),
-            "d_next": d_next.squeeze(),
-            "timeout": timeout.astype(jnp.float32).squeeze(),
-            "any_collision": any_collision.astype(jnp.float32).squeeze(),
-        }
 
     def _compute_reward(
         self,
@@ -1388,171 +829,6 @@ class RobotPedEnv(MultiAgentEnv):
         reward = terms["reward"]
         assert reward.shape == tuple()
         return reward
-
-    def _compute_reward2(
-        self,
-        graph: EnvGraphsTuple,
-        next_agent_states: AgentState,
-        action: Action,
-        collision_obs_attempt: Array | None = None,
-    ) -> Reward:
-        """Paper-style reward: goal, obstacle, rotation, heading."""
-        agent_states = graph.type_states(type_idx=0, n_type=1)
-        agent_pos = agent_states[:, :2]
-        goal_pos = graph.env_states.goal[:, :2]
-        ped_states = graph.type_states(type_idx=2, n_type=self._params["n_ped"])
-        ped_pos = ped_states[:, :2]
-
-        d_prev = jnp.linalg.norm(agent_pos - goal_pos, axis=-1)
-        d_next = jnp.linalg.norm(next_agent_states[:, :2] - goal_pos, axis=-1)
-
-        r_goal = float(self._params.get("r_goal", 20.0))
-        r_path = float(self._params.get("r_path", 3.2))
-        g_m = float(self._params.get("g_m", 0.3))
-        t_max = float(self.max_episode_steps) * float(self.dt)
-        t_now = float(self._t) * self.dt
-
-        reach = d_next < g_m
-        timeout = t_now >= t_max
-        r_g = jnp.where(reach, r_goal, jnp.where(timeout, -r_goal, r_path * (d_prev - d_next)))
-
-        # obstacle/ped clearance
-        ped_clear_all = jnp.full((1, 0), jnp.inf)
-        if ped_pos.shape[0] > 0:
-            ped_dist = jnp.linalg.norm(agent_pos[:, None, :] - ped_pos[None, :, :], axis=-1)
-            ped_clear_all = ped_dist - (self._params["car_radius"] + self._params["ped_radius"])
-
-        lidar = get_lidar(
-            agent_pos[0, :],
-            graph.env_states.obstacle,
-            self._params["n_rays"],
-            self._params["comm_radius"],
-        )
-        lidar_dist = jnp.linalg.norm(lidar - agent_pos[0, :], axis=-1)
-        obs_clear_all = (lidar_dist - self._params["car_radius"])[None, :]
-
-        all_clear = jnp.concatenate([ped_clear_all, obs_clear_all], axis=1)
-        d_min = jnp.min(all_clear, axis=1)
-
-        d_m = float(self._params.get("d_m", 1.2))
-        r_collision = float(self._params.get("r_collision", -20.0))
-        r_obstacle = float(self._params.get("r_obstacle", -0.2))
-
-        collision = d_min <= 0.0
-        if collision_obs_attempt is not None:
-            collision = jnp.logical_or(collision, collision_obs_attempt)
-        r_c = jnp.where(collision, r_collision, jnp.where(d_min <= d_m, r_obstacle * (d_m - d_min), 0.0))
-
-        r_rotation = float(self._params.get("r_rotation", -0.1))
-        omega_m = float(self._params.get("omega_m", 1.0))
-        omega = next_agent_states[:, 4]
-        r_w = jnp.where(jnp.abs(omega) > omega_m, r_rotation * jnp.abs(omega), 0.0)
-
-        target_xy, _ = self._heading_target_from_state(
-            graph.env_states, next_agent_states, advance=True
-        )
-        theta_d = self._desired_heading_angle(
-            agent_states,
-            graph.env_states.goal,
-            ped_states,
-            graph.env_states.obstacle,
-            target_pos=target_xy[None, :],
-        )
-        theta_m = float(self._params.get("heading_theta_m", np.pi / 6))
-        r_angle = float(self._params.get("heading_r_angle", 0.6))
-        r_d = r_angle * jnp.clip(theta_m - jnp.abs(theta_d), a_min=0.0, a_max=None)
-
-        reward = r_g + r_c + r_w + r_d
-        assert reward.shape == (1,)
-        return reward.squeeze()
-
-    def _compute_reward2_terms(
-        self,
-        graph: EnvGraphsTuple,
-        next_agent_states: AgentState,
-        action: Action,
-        collision_obs_attempt: Array | None = None,
-    ) -> dict:
-        """Return reward2 components and key intermediate values for debugging."""
-        agent_states = graph.type_states(type_idx=0, n_type=1)
-        agent_pos = agent_states[:, :2]
-        goal_pos = graph.env_states.goal[:, :2]
-        ped_states = graph.type_states(type_idx=2, n_type=self._params["n_ped"])
-        ped_pos = ped_states[:, :2]
-
-        d_prev = jnp.linalg.norm(agent_pos - goal_pos, axis=-1)
-        d_next = jnp.linalg.norm(next_agent_states[:, :2] - goal_pos, axis=-1)
-
-        r_goal = float(self._params.get("r_goal", 20.0))
-        r_path = float(self._params.get("r_path", 3.2))
-        g_m = float(self._params.get("g_m", 0.3))
-        t_max = float(self.max_episode_steps) * float(self.dt)
-        t_now = float(self._t) * self.dt
-
-        reach = d_next < g_m
-        timeout = t_now >= t_max
-        r_g = jnp.where(reach, r_goal, jnp.where(timeout, -r_goal, r_path * (d_prev - d_next)))
-
-        ped_clear_all = jnp.full((1, 0), jnp.inf)
-        if ped_pos.shape[0] > 0:
-            ped_dist = jnp.linalg.norm(agent_pos[:, None, :] - ped_pos[None, :, :], axis=-1)
-            ped_clear_all = ped_dist - (self._params["car_radius"] + self._params["ped_radius"])
-
-        lidar = get_lidar(
-            agent_pos[0, :],
-            graph.env_states.obstacle,
-            self._params["n_rays"],
-            self._params["comm_radius"],
-        )
-        lidar_dist = jnp.linalg.norm(lidar - agent_pos[0, :], axis=-1)
-        obs_clear_all = (lidar_dist - self._params["car_radius"])[None, :]
-
-        all_clear = jnp.concatenate([ped_clear_all, obs_clear_all], axis=1)
-        d_min = jnp.min(all_clear, axis=1)
-
-        d_m = float(self._params.get("d_m", 1.2))
-        r_collision = float(self._params.get("r_collision", -20.0))
-        r_obstacle = float(self._params.get("r_obstacle", -0.2))
-
-        collision = d_min <= 0.0
-        if collision_obs_attempt is not None:
-            collision = jnp.logical_or(collision, collision_obs_attempt)
-        r_c = jnp.where(collision, r_collision, jnp.where(d_min <= d_m, r_obstacle * (d_m - d_min), 0.0))
-
-        r_rotation = float(self._params.get("r_rotation", -0.1))
-        omega_m = float(self._params.get("omega_m", 1.0))
-        omega = next_agent_states[:, 4]
-        r_w = jnp.where(jnp.abs(omega) > omega_m, r_rotation * jnp.abs(omega), 0.0)
-
-        target_xy, _ = self._heading_target_from_state(
-            graph.env_states, next_agent_states, advance=True
-        )
-        theta_d = self._desired_heading_angle(
-            agent_states,
-            graph.env_states.goal,
-            ped_states,
-            graph.env_states.obstacle,
-            target_pos=target_xy[None, :],
-        )
-        theta_m = float(self._params.get("heading_theta_m", np.pi / 6))
-        r_angle = float(self._params.get("heading_r_angle", 0.6))
-        r_d = r_angle * jnp.clip(theta_m - jnp.abs(theta_d), a_min=0.0, a_max=None)
-
-        reward = r_g + r_c + r_w + r_d
-        return {
-            "reward": reward.squeeze(),
-            "r_g": r_g.squeeze(),
-            "r_c": r_c.squeeze(),
-            "r_w": r_w.squeeze(),
-            "r_d": r_d.squeeze(),
-            "d_prev": d_prev.squeeze(),
-            "d_next": d_next.squeeze(),
-            "d_min": d_min.squeeze(),
-            "theta_d": theta_d.squeeze(),
-            "reach": reach.squeeze(),
-            "timeout": timeout,
-            "collision": collision.squeeze(),
-        }
 
     def _desired_heading_angle(
         self,
@@ -1725,27 +1001,7 @@ class RobotPedEnv(MultiAgentEnv):
         return [agent_ped_edges, agent_obs_edges]
 
     def control_affine_dyn(self, state: State):
-        assert state.ndim == 2
-        f = jnp.concatenate(
-            [
-                (jnp.cos(state[:, 2]) * state[:, 3])[:, None],
-                (jnp.sin(state[:, 2]) * state[:, 3])[:, None],
-                state[:, 4:5],
-                jnp.zeros((state.shape[0], 2)),
-            ],
-            axis=1,
-        )
-        g = jnp.array(
-            [
-                [0.0, 0.0],
-                [0.0, 0.0],
-                [0.0, 0.0],
-                [0.0, 1.0],
-                [1.0, 0.0],
-            ]
-        )
-        g = jnp.expand_dims(g, axis=0).repeat(f.shape[0], axis=0)
-        return f, g
+        return self._dynamics.control_affine_dyn(state)
 
     def add_edge_feats(self, graph: GraphsTuple, state: State) -> GraphsTuple:
         assert graph.is_single
@@ -1881,51 +1137,16 @@ class RobotPedEnv(MultiAgentEnv):
         ).to_padded()
 
     def state_lim(self, state: Optional[State] = None) -> Tuple[State, State]:
-        lower_lim = jnp.array(
-            [-jnp.inf, -jnp.inf, -jnp.inf, self._params["v_min"], self._params["w_min"]]
-        )
-        upper_lim = jnp.array(
-            [jnp.inf, jnp.inf, jnp.inf, self._params["v_max"], self._params["w_max"]]
-        )
-        return lower_lim, upper_lim
+        return self._dynamics.state_lim()
 
     def action_lim(self) -> Tuple[Action, Action]:
-        if self._is_vw_command_mode():
-            if self._params.get("action_mode", "discrete_delta") == "discrete_vw_grid":
-                v_bins, w_bins = self._get_vw_grid_bins()
-                lower_lim = jnp.array([w_bins.min(), v_bins.min()], dtype=jnp.float32)
-                upper_lim = jnp.array([w_bins.max(), v_bins.max()], dtype=jnp.float32)
-            else:
-                lower_lim = jnp.array([self._params["w_min"], self._params["v_min"]], dtype=jnp.float32)
-                upper_lim = jnp.array([self._params["w_max"], self._params["v_max"]], dtype=jnp.float32)
-        else:
-            a_w_max = self._params.get("a_w_max", self._params["delta_omega_max"])
-            a_v_max = self._params.get("a_v_max", self._params["delta_v_max"])
-            lower_lim = jnp.array([-a_w_max, -a_v_max], dtype=jnp.float32)
-            upper_lim = jnp.array([a_w_max, a_v_max], dtype=jnp.float32)
-        return lower_lim, upper_lim
+        return self._dynamics.action_lim()
 
     def _discretize_action(self, action: Action) -> Action:
-        step_w = self._params.get("a_w_step", self._params["delta_w_step"])
-        step_v = self._params.get("a_v_step", self._params["delta_v_step"])
-        w = action[:, 0]
-        v = action[:, 1]
-        w_disc = jnp.where(w > step_w / 2, step_w, jnp.where(w < -step_w / 2, -step_w, 0.0))
-        v_disc = jnp.where(v > step_v / 2, step_v, jnp.where(v < -step_v / 2, -step_v, 0.0))
-        return jnp.stack([w_disc, v_disc], axis=-1)
+        return self._dynamics.discretize_action(action)
 
     def _apply_action_mode(self, agent_states: AgentState, action: Action) -> Action:
-        if not self._is_vw_command_mode():
-            return action
-        a_w_max = self._params.get("a_w_max", self._params["delta_omega_max"])
-        a_v_max = self._params.get("a_v_max", self._params["delta_v_max"])
-        w_cmd = action[:, 0]
-        v_cmd = action[:, 1]
-        w = agent_states[:, 4]
-        v = agent_states[:, 3]
-        delta_w = jnp.clip(w_cmd - w, a_min=-a_w_max, a_max=a_w_max)
-        delta_v = jnp.clip(v_cmd - v, a_min=-a_v_max, a_max=a_v_max)
-        return jnp.stack([delta_w, delta_v], axis=-1)
+        return self._dynamics.apply_action_mode(agent_states, action)
 
     def _empty_train_cbf_info(self) -> dict:
         zero = jnp.array(0.0, dtype=jnp.float32)

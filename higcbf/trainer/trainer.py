@@ -158,6 +158,30 @@ class Trainer:
         finish_fn = jax_vmap(jax_vmap(self.env_test.finish_mask))
         return rollout_fn, test_fn, finish_fn
 
+    def _sample_reward_components(self, key: jax.Array) -> dict:
+        """
+        Run one eval episode Python-side (not jitted) with get_eval_info=True
+        to collect per-component reward averages for wandb logging.
+        """
+        try:
+            env = self.env_test
+            graph = env.reset(key)
+            components_acc: dict[str, list] = {}
+            for _ in range(env.max_episode_steps):
+                action = self.algo.act(graph, self.algo.actor_params)
+                next_graph, _reward, _cost, done, info = env.step(graph, action, get_eval_info=True)
+                for k, v in info.items():
+                    try:
+                        components_acc.setdefault(k, []).append(float(np.asarray(v)))
+                    except Exception:
+                        pass
+                graph = next_graph
+                if bool(done):
+                    break
+            return {f"eval/r/{k}": float(np.mean(vs)) for k, vs in components_acc.items() if vs}
+        except Exception:
+            return {}
+
     def train(self):
         # record start time
         start_time = time()
@@ -216,6 +240,9 @@ class Trainer:
                         )
                     if self.save_log:
                         self.curriculum.save_state(self.curriculum_state_path)
+
+                reward_component_info = self._sample_reward_components(test_key)
+                eval_info.update(reward_component_info)
 
                 wandb.log(eval_info, step=self.update_steps)
                 time_since_start = time() - start_time

@@ -55,12 +55,3 @@ class TanhTransformedDistribution(tfd.TransformedDistribution):
     def experimental_is_sharded(self):
         raise NotImplementedError
 
-    def _sample_n(self, n, seed=None, **kwargs):
-        pass
-
-    def _variance(self, **kwargs):
-        pass
-
-    @classmethod
-    def _maximum_likelihood_parameters(cls, value):
-        pass

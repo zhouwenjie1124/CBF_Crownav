@@ -11,13 +11,6 @@ from ..utils.graph import GraphsTuple
 from .mlp import MLP, default_nn_init
 from .utils import safe_get
 
-save_attn = False
-
-
-def save_set_attn(v):
-    global save_attn
-    save_attn = v
-
 
 class GNNUpdate(NamedTuple):
     message: Callable[[EdgeAttr, Node, Node], Array]
@@ -84,7 +77,13 @@ class GNN(nn.Module):
     n_layers: int
 
     @nn.compact
-    def __call__(self, graph: GraphsTuple, node_type: int = None, n_type: int = None) -> Array:
+    def __call__(
+        self,
+        graph: GraphsTuple,
+        node_type: int = None,
+        n_type: int = None,
+        return_attn: bool = False,
+    ) -> Array:
         for i in range(self.n_layers):
             out_dim = self.out_dim if i == self.n_layers - 1 else self.msg_dim
             msg_net = ft.partial(MLP, hid_sizes=self.hid_size_msg, act=nn.relu, act_final=False, name="msg")
@@ -98,7 +97,7 @@ class GNN(nn.Module):
                 out_dim=out_dim,
             )
             graph = gnn_layer(graph)
-        if node_type is None:
-            return graph.nodes
-        else:
-            return graph.type_nodes(node_type, n_type)
+        node_feats = graph.nodes if node_type is None else graph.type_nodes(node_type, n_type)
+        if return_attn:
+            return node_feats, []
+        return node_feats

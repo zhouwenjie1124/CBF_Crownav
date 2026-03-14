@@ -1,7 +1,9 @@
 import functools as ft
+import os
 import einops as ei
 import jax
 import jax.numpy as jnp
+import yaml
 
 from jaxproxqp.jaxproxqp import JaxProxQP
 from typing import Optional, Tuple
@@ -46,17 +48,20 @@ class DecShareCBF(MultiAgentController):
 
     @property
     def actor_params(self) -> Params:
-        raise NotImplementedError
+        # CBF has no learned parameters; return config so the trainer can pass it as-is.
+        return {"cbf_alpha": self.cbf_alpha, "k": self.k}
 
     def step(self, graph: GraphsTuple, key: PRNGKey, params: Optional[Params] = None) -> Tuple[Action, Array]:
-        raise NotImplementedError
+        action = self.get_qp_action(graph)[0]
+        return action, jnp.array(0.0)
 
     def get_cbf(self, graph: GraphsTuple) -> tuple[Array, Array]:
         ak_h0, ak_isobs = self.cbf(graph)
         return ak_h0, ak_isobs
 
     def update(self, rollout: Rollout, step: int) -> dict:
-        raise NotImplementedError
+        # CBF is not learned; nothing to update.
+        return {}
 
     def act(self, graph: GraphsTuple, params: Optional[Params] = None) -> Action:
         return self.get_qp_action(graph)[0]
@@ -150,7 +155,14 @@ class DecShareCBF(MultiAgentController):
         return u_opt, r
 
     def save(self, save_dir: str, step: int):
-        raise NotImplementedError
+        os.makedirs(save_dir, exist_ok=True)
+        path = os.path.join(save_dir, f"cbf_params_{step}.yaml")
+        with open(path, "w") as f:
+            yaml.safe_dump({"cbf_alpha": float(self.cbf_alpha), "k": int(self.k)}, f)
 
     def load(self, load_dir: str, step: int):
-        raise NotImplementedError
+        path = os.path.join(load_dir, f"cbf_params_{step}.yaml")
+        with open(path) as f:
+            data = yaml.safe_load(f)
+        self.cbf_alpha = float(data["cbf_alpha"])
+        self.k = int(data["k"])
