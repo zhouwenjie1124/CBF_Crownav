@@ -1,0 +1,101 @@
+# Reward Hyperparameter Sweep Configuration
+# ==========================================
+# Used by sweep_reward.py (local parallel runner) AND compatible with wandb sweep.
+#
+# wandb sweep usage:
+#   wandb sweep configs/sweep_reward.yaml          # creates a sweep, prints sweep_id
+#   wandb agent <entity/project/sweep_id>          # launch agents
+#
+# Local runner usage:
+#   python sweep_reward.py --config configs/sweep_reward.yaml --n-trials 8 --jobs 2
+
+# ------ wandb sweep metadata (ignored by local runner) ------
+program: train.py
+method: bayes          # bayes | grid | random
+metric:
+  name: eval/success
+  goal: maximize
+early_terminate:
+  type: hyperband
+  min_iter: 5          # stop runs that look bad after 5 evals
+
+# ------ shared train.py CLI args (fixed across all runs) ------
+# These are injected verbatim by the local runner; wandb sweep uses the 'command' block.
+base_command: >
+  --algo ppo
+  --env RobotPedEnv
+  -n 1
+  --area-size 12
+  --obs 8
+  --n-rays 32
+  --max-step 256
+  --steps 300
+  --eval-interval 25
+  --eval-epi 32
+  --save-interval 9999
+  --reward-mode proactive
+  --n-env-train 8
+  --n-env-test 16
+
+# ------ search space ------
+# Each param is passed to train.py via --reward-override key=value
+parameters:
+  kappa_succ:
+    distribution: int_uniform
+    min: 15
+    max: 40
+
+  kappa_col:
+    distribution: int_uniform
+    min: -40
+    max: -15
+
+  kappa_prog:
+    distribution: uniform
+    min: 0.5
+    max: 5.0
+
+  kappa_safe:
+    distribution: uniform
+    min: 0.2
+    max: 3.0
+
+  kappa_ttc:
+    distribution: uniform
+    min: -1.0
+    max: -0.05
+
+  kappa_time:
+    distribution: uniform
+    min: 0.01
+    max: 0.1
+
+# Parameters to fix (not swept) — override here if needed:
+fixed:
+  kappa_timeout: -15.0
+  kappa_omega: 0.01
+  kappa_delta: 0.1
+  lambda_omega: 1.0
+  safety_margin: 0.3
+  heading_r_angle: 0.6
+
+# ------ wandb sweep command block (wandb-only) ------
+command:
+  - python
+  - train.py
+  - --algo ppo
+  - --env RobotPedEnv
+  - -n 1
+  - --area-size 12
+  - --obs 8
+  - --steps 300
+  - --eval-interval 25
+  - --eval-epi 32
+  - --reward-mode proactive
+  - --reward-override
+  - "kappa_succ=${kappa_succ}"
+  - "kappa_col=${kappa_col}"
+  - "kappa_prog=${kappa_prog}"
+  - "kappa_safe=${kappa_safe}"
+  - "kappa_ttc=${kappa_ttc}"
+  - "kappa_time=${kappa_time}"
