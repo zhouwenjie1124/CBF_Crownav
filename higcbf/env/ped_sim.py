@@ -20,30 +20,56 @@ class PedCBFController:
 
 
 def build_ped_graph(
-    ped_states: Array,  # (n_ped, 4)
-    robot_state: Array,  # (1, 4)
-    robot_lidar: Array,  # (n_rays, 2)
-    ped_goal: Array,  # (n_ped, 2)
-    ped_lidar: Array,  # (n_ped, n_rays, 2)
-    ped_speed_pref: Array,  # (n_ped,)
+    ped_states: Array,      # (n_ped, 4)          pedestrian states [x, y, vx, vy]
+    robot_state: Array,     # (1, 4)              robot state in double-integrator coords [x, y, vx, vy]
+    robot_lidar: Array,     # (n_rays, 2)         robot lidar hit positions [x, y]
+    ped_goal: Array,        # (n_ped, 2)          goal position for each pedestrian [x, y]
+    ped_lidar: Array,       # (n_ped, n_rays, 2)  lidar hit positions for each pedestrian [x, y]
+    ped_speed_pref: Array,  # (n_ped,)            preferred speed scalar for each pedestrian
 ) -> GraphsTuple:
+    """
+    Pack raw pedestrian simulation states into a GraphsTuple for DecShareCBF.
+
+    Node layout (n_nodes = n_ped + 1 + n_rays total nodes):
+        [0 : n_ped]          — pedestrian agent nodes,  node_type=0
+        [n_ped]              — robot node,              node_type=1 (obstacle)
+        [n_ped+1 : n_nodes]  — robot lidar hit nodes,  node_type=1 (obstacle)
+
+    states tensor (n_nodes, 4):
+        pedestrian nodes : [x, y, vx, vy]  — copied directly from ped_states
+        robot node       : [x, y, vx, vy]  — converted from robot_state
+        lidar nodes      : [x, y,  0,  0]  — hit position, velocity padded with zeros
+
+    Edges (n_nodes edges, star topology with node 0 as the shared sender):
+        edge[i] = states[i] - states[0], i.e. relative state w.r.t. node 0.
+        This is the minimal edge representation required by GraphsTuple;
+        the CBF solver uses states directly, not edges.
+
+    Returns:
+        GraphsTuple whose env_states carries ped_goal / ped_lidar / ped_speed_pref,
+        consumed by PedEnvWrapper.u_ref() to compute the reference control.
+    """
     n_ped = ped_states.shape[0]
     n_rays = robot_lidar.shape[0]
 
-    # Node order: ped agents, robot, robot_lidar
+    # Node order: pedestrian agents, robot, robot lidar hits
     n_nodes = n_ped + 1 + n_rays
     node_feats = jnp.zeros((n_nodes, 4), dtype=jnp.float32)
 
+    # node_type=0: agent (pedestrian); node_type=1: obstacle (robot + lidar points)
     node_type = jnp.zeros((n_nodes,), dtype=jnp.int32)
-    node_type = node_type.at[n_ped:].set(1)  # obstacles: robot + lidar
+    node_type = node_type.at[n_ped:].set(1)
 
+    # Lidar hit points have no velocity; pad with zeros to get shape (n_rays, 4)
     robot_lidar_state = jnp.concatenate([robot_lidar, jnp.zeros((n_rays, 2))], axis=-1)
+    # states: (n_nodes, 4), concatenated in node order
     states = jnp.concatenate([ped_states, robot_state, robot_lidar_state], axis=0)
 
-    # Minimal edges; only needed to satisfy GraphsTuple usage in DecShareCBF.
+    # Minimal star-topology edges: every node connects to node 0 as sender
+    # Only needed to satisfy the GraphsTuple interface; CBF uses states directly
     receivers = jnp.arange(n_nodes, dtype=jnp.int32)
     senders = jnp.zeros((n_nodes,), dtype=jnp.int32)
-    edges = states[receivers] - states[senders]
+    edges = states[receivers] - states[senders]  # Only needed to satisfy the GraphsTuple interface; CBF uses states directly
 
     n_node = jnp.array(n_nodes, dtype=jnp.int32)
     n_edge = jnp.array(n_nodes, dtype=jnp.int32)
@@ -55,13 +81,13 @@ def build_ped_graph(
     return GraphsTuple(
         n_node=n_node,
         n_edge=n_edge,
-        nodes=node_feats,
-        edges=edges,
-        states=states,
-        receivers=receivers,
-        senders=senders,
-        node_type=node_type,
-        env_states=env_states,
+        nodes=node_feats,        # (n_nodes, 4)  zero-filled placeholder; actual states are in `states`
+        edges=edges,             # (n_nodes, 4)  relative state of each node w.r.t. node 0
+        states=states,           # (n_nodes, 4)  absolute state [x, y, vx, vy] for every node
+        receivers=receivers,     # (n_nodes,)    destination node index for each edge
+        senders=senders,         # (n_nodes,)    source node index for each edge (all 0)
+        node_type=node_type,     # (n_nodes,)    0=agent (pedestrian), 1=obstacle (robot/lidar)
+        env_states=env_states,   # PedGraphEnvState  carries goal, lidar, and preferred speed
         connectivity=None,
     )
 

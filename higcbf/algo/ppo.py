@@ -60,6 +60,7 @@ class PPO(MultiAgentController):
             rnn_hidden_dim: int = 64,
             rnn_seq_len: int = 32,
             rnn_minibatch_chunks: int = 64,
+            use_hetero_attn: bool = False,
             **kwargs
     ):
         super().__init__(
@@ -112,6 +113,7 @@ class PPO(MultiAgentController):
         self.rnn_hidden_dim = rnn_hidden_dim
         self.rnn_seq_len = rnn_seq_len
         self.rnn_minibatch_chunks = rnn_minibatch_chunks
+        self.use_hetero_attn = use_hetero_attn
 
         u_lb, u_ub = env.action_lim()
         self._action_scale = (u_ub - u_lb) / 2.0
@@ -143,6 +145,7 @@ class PPO(MultiAgentController):
             concat_robot_state=concat_robot_state,
             use_gru=use_gru,
             rnn_hidden_dim=rnn_hidden_dim,
+            use_hetero_attn=use_hetero_attn,
         )
         self.value = ValueNet(
             node_dim=node_dim,
@@ -152,6 +155,7 @@ class PPO(MultiAgentController):
             concat_robot_state=concat_robot_state,
             use_gru=use_gru,
             rnn_hidden_dim=rnn_hidden_dim,
+            use_hetero_attn=use_hetero_attn,
         )
 
         key = jr.PRNGKey(seed)
@@ -295,6 +299,7 @@ class PPO(MultiAgentController):
             "rnn_seq_len": self.rnn_seq_len,
             "rnn_minibatch_chunks": self.rnn_minibatch_chunks,
             "n_discrete_actions": None if self._discrete_action_grid is None else int(self._discrete_action_grid.shape[0]),
+            "use_hetero_attn": self.use_hetero_attn,
         }
 
     @property

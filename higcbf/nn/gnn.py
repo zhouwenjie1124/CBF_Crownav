@@ -101,3 +101,69 @@ class GNN(nn.Module):
         if return_attn:
             return node_feats, []
         return node_feats
+
+
+class SelfAttnGNN(nn.Module):
+    """
+    Graph Transformer encoder (CrowdNav_HEIGHT-style heterogeneous attention).
+
+    Replaces message-passing with multi-head self-attention over all graph nodes.
+    Each node attends to every other node, capturing robot-pedestrian (RH) and
+    pedestrian-pedestrian (HH) interactions simultaneously — matching the dual
+    attention design of CrowdNav_HEIGHT's selfAttn_merge_SRNN.
+
+    Architecture per layer:
+        x = LayerNorm(x + MultiHeadSelfAttn(x))   # spatial interaction
+        x = LayerNorm(x + FFN(x))                  # per-node transform
+
+    The padding node (node_type=-1) participates in attention but its influence
+    is diluted by softmax normalisation, matching the behaviour of the base GNN.
+
+    Interface is identical to GNN so it can be used as a drop-in dist_base /
+    value_gnn replacement by passing use_hetero_attn=True to PPO.
+    """
+    out_dim: int
+    attn_dim: int = 64
+    num_heads: int = 4
+    n_layers: int = 1
+
+    @nn.compact
+    def __call__(
+        self,
+        graph: GraphsTuple,
+        node_type: int = None,
+        n_type: int = None,
+        return_attn: bool = False,
+    ) -> Array:
+        # Initial node embedding: (n_nodes, node_dim) → (n_nodes, attn_dim)
+        x = MLP(hid_sizes=(self.attn_dim,), act=nn.relu, act_final=True, name="node_embed")(graph.nodes)
+
+        # Transformer layers: self-attention + FFN with residual + LayerNorm
+        for i in range(self.n_layers):
+            # Multi-head self-attention over all nodes
+            # x[None]: (1, n_nodes, attn_dim) required by Flax MHA batch convention
+            x_attn = nn.MultiHeadDotProductAttention(
+                num_heads=self.num_heads,
+                name=f"self_attn_{i}",
+            )(x[None], x[None]).squeeze(0)  # (n_nodes, attn_dim)
+            x = nn.LayerNorm(name=f"attn_ln_{i}")(x + x_attn)
+
+            # Feed-forward network (expand then contract)
+            x_ffn = MLP(
+                hid_sizes=(self.attn_dim * 2, self.attn_dim),
+                act=nn.relu,
+                act_final=True,
+                name=f"ffn_{i}",
+            )(x)
+            x = nn.LayerNorm(name=f"ffn_ln_{i}")(x + x_ffn)
+
+        # Project to output dimension
+        x = nn.Dense(self.out_dim, kernel_init=default_nn_init(), name="out_proj")(x)
+
+        # Extract nodes of the requested type (e.g. type=0 for agent/robot nodes)
+        if node_type is not None and n_type is not None:
+            x = graph._replace(nodes=x).type_nodes(node_type, n_type)
+
+        if return_attn:
+            return x, []
+        return x

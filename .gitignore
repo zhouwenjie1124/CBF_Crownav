@@ -1,0 +1,49 @@
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Distribution / packaging
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# Virtual environments (root-level only)
+/.venv/
+/venv/
+/env/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# JAX / XLA cache
+/tmp/
+
+# Experiment outputs
+wandb/
+logs/
+figs/
+videos/
+data/
+2_png/
+test_log.csv
+
+# Model checkpoints
+*.pkl
+*.pt
+*.ckpt
+
+# Misc
+*.swp
+*.swo

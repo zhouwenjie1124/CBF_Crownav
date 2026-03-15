@@ -215,6 +215,27 @@ def r_timeout(is_timeout: Array, params: dict) -> Array:
     return jnp.where(is_timeout, kappa, 0.0)
 
 
+def r_discomfort(ped_clear_all: Array, params: dict) -> Array:
+    """
+    Social comfort zone penalty (CrowdNav_HEIGHT style).
+
+    Counts the number of pedestrians inside the robot's personal space and
+    applies a per-violation penalty.  This is softer than r_safe_margin (which
+    penalises continuous clearance) and models social norms rather than safety.
+
+    Params
+    ------
+    comfort_dist    : float  clearance threshold for personal space (default 0.3 m)
+    kappa_discomfort: float  penalty per pedestrian in zone (default -0.5)
+    """
+    comfort_dist = float(params.get("comfort_dist", 0.3))
+    kappa = float(params.get("kappa_discomfort", -0.5))
+    if ped_clear_all.shape[1] == 0:
+        return jnp.zeros((ped_clear_all.shape[0],))
+    in_zone = (ped_clear_all < comfort_dist).astype(jnp.float32).sum(axis=1)
+    return kappa * in_zone
+
+
 # ---------------------------------------------------------------------------
 # Paper-mode components
 # ---------------------------------------------------------------------------
@@ -416,4 +437,113 @@ def assemble_paper(
         "is_reached": is_reached.astype(jnp.float32).squeeze(),
         "timeout": is_timeout.astype(jnp.float32).squeeze(),
         "collision": collision.astype(jnp.float32).squeeze(),
+    }
+
+
+def assemble_height(
+    *,
+    agent_pos: Array,           # (1, 2)
+    next_agent_states: Array,   # (1, 5)  [x, y, θ, v, w]
+    goal_pos: Array,            # (1, 2)
+    ped_pos: Array,             # (n_ped, 2)
+    lidar_dist: Array,          # (n_rays,)
+    is_timeout: Array,
+    collision_obs_attempt: Optional[Array],
+    params: dict,
+) -> dict:
+    """
+    CrowdNav_HEIGHT reward (fully independent of legacy/proactive/paper modes).
+
+    Components
+    ----------
+    r_cn_success  : +r_cn_goal (default +20)  on reaching goal
+    r_cn_collision: +r_cn_col  (default -20)  on any collision
+    r_cn_timeout  : +r_cn_col  (default -20)  on timeout (same penalty)
+    r_cn_progress : kappa_cn_prog * (d_prev - d_next)  dense potential shaping
+    r_cn_discomfort: kappa_cn_disc * count(peds within comfort_dist)
+    r_cn_spin     : -kappa_cn_spin * |omega|  angular velocity cost
+
+    Params (all have defaults matching CrowdNav_HEIGHT paper values)
+    ------
+    r_cn_goal       : float  goal reward          (default  20.0)
+    r_cn_col        : float  collision penalty     (default -20.0)
+    kappa_cn_prog   : float  progress weight       (default   2.0)
+    comfort_dist    : float  personal space radius (default   0.3 m)
+    kappa_cn_disc   : float  discomfort penalty    (default  -0.5 per ped)
+    kappa_cn_spin   : float  spin penalty weight   (default   0.05)
+    kappa_cn_time   : float  per-step time cost    (default  -0.025)
+    goal_tolerance  : float  success radius        (default   0.1 m)
+    """
+    car_radius = float(params["car_radius"])
+    ped_radius = float(params["ped_radius"])
+
+    d_prev = jnp.linalg.norm(agent_pos - goal_pos, axis=-1)
+    d_next = jnp.linalg.norm(next_agent_states[:, :2] - goal_pos, axis=-1)
+
+    # --- collision detection ---
+    if ped_pos.shape[0] > 0:
+        ped_dist = jnp.linalg.norm(agent_pos[:, None, :] - ped_pos[None, :, :], axis=-1)
+        ped_clear_all = ped_dist - (car_radius + ped_radius)   # (1, n_ped)
+    else:
+        ped_clear_all = jnp.full((1, 0), jnp.inf)
+    obs_clear_all = (lidar_dist - car_radius)[None, :]          # (1, n_rays)
+
+    any_ped_col = (ped_clear_all <= 0.0).any(axis=1)
+    any_obs_col = (obs_clear_all <= 0.0).any(axis=1)
+    if collision_obs_attempt is not None:
+        any_obs_col = jnp.logical_or(any_obs_col, collision_obs_attempt)
+    any_collision = jnp.logical_or(any_ped_col, any_obs_col)
+
+    # --- main task reward: success / collision / timeout ---
+    goal_tol = float(params.get("goal_tolerance", 0.1))
+    r_goal_val = float(params.get("r_cn_goal", 20.0))
+    r_col_val = float(params.get("r_cn_col", -20.0))
+    is_reached = d_next <= goal_tol
+
+    r_cn_task = jnp.where(
+        is_reached,
+        r_goal_val,
+        jnp.where(any_collision, r_col_val,
+                  jnp.where(is_timeout, r_col_val, 0.0)),
+    )
+
+    # --- dense progress reward (potential-based shaping) ---
+    kappa_prog = float(params.get("kappa_cn_prog", 2.0))
+    r_cn_progress = kappa_prog * (d_prev - d_next)
+    # Zero out progress on terminal steps (success/collision/timeout absorb the signal)
+    not_terminal = ~(is_reached | any_collision | is_timeout)
+    r_cn_progress = r_cn_progress * not_terminal.astype(jnp.float32)
+
+    # --- discomfort penalty: peds inside personal space ---
+    comfort_dist = float(params.get("comfort_dist", 0.3))
+    kappa_disc = float(params.get("kappa_cn_disc", -0.5))
+    if ped_clear_all.shape[1] > 0:
+        in_zone = (ped_clear_all < comfort_dist).astype(jnp.float32).sum(axis=1)
+        r_cn_discomfort = kappa_disc * in_zone
+    else:
+        r_cn_discomfort = jnp.zeros_like(d_next)
+
+    # --- spin penalty: discourage excessive rotation ---
+    omega = next_agent_states[:, 4]
+    kappa_spin = float(params.get("kappa_cn_spin", 0.05))
+    r_cn_spin = -kappa_spin * jnp.abs(omega)
+
+    # --- per-step time cost ---
+    kappa_time = float(params.get("kappa_cn_time", -0.025))
+    r_cn_time = kappa_time * jnp.ones_like(d_next)
+
+    reward = r_cn_task + r_cn_progress + r_cn_discomfort + r_cn_spin + r_cn_time
+
+    return {
+        "reward": reward.squeeze(),
+        "r_cn_task": r_cn_task.squeeze(),
+        "r_cn_progress": r_cn_progress.squeeze(),
+        "r_cn_discomfort": r_cn_discomfort.squeeze(),
+        "r_cn_spin": r_cn_spin.squeeze(),
+        "r_cn_time": r_cn_time.squeeze(),
+        "d_prev": d_prev.squeeze(),
+        "d_next": d_next.squeeze(),
+        "is_reached": is_reached.astype(jnp.float32).squeeze(),
+        "any_collision": any_collision.astype(jnp.float32).squeeze(),
+        "timeout": is_timeout.astype(jnp.float32).squeeze(),
     }

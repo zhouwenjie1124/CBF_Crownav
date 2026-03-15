@@ -11,7 +11,7 @@ from .distribution import TanhTransformedDistribution, tfd
 from ...utils.typing import Action, Array
 from ...utils.graph import GraphsTuple
 from ...nn.utils import default_nn_init, scaled_init
-from ...nn.gnn import GNN
+from ...nn.gnn import GNN, SelfAttnGNN
 from ...nn.mlp import MLP
 from ...utils.typing import PRNGKey, Params
 
@@ -329,19 +329,30 @@ class PPOPolicy(MultiAgentPolicy):
             concat_robot_state: bool = False,
             use_gru: bool = False,
             rnn_hidden_dim: int = 64,
+            use_hetero_attn: bool = False,
     ):
         super().__init__(node_dim, edge_dim, n_agents, action_dim)
         self.use_gru = use_gru
         self.rnn_hidden_dim = rnn_hidden_dim
-        self.dist_base = ft.partial(
-            GNN,
-            msg_dim=64,
-            hid_size_msg=(128, 128),
-            hid_size_aggr=(128, 128),
-            hid_size_update=(128, 128),
-            out_dim=64,
-            n_layers=gnn_layers
-        )
+        if use_hetero_attn:
+            # CrowdNav_HEIGHT-style Graph Transformer: self-attention over all nodes
+            self.dist_base = ft.partial(
+                SelfAttnGNN,
+                out_dim=64,
+                attn_dim=64,
+                num_heads=4,
+                n_layers=gnn_layers,
+            )
+        else:
+            self.dist_base = ft.partial(
+                GNN,
+                msg_dim=64,
+                hid_size_msg=(128, 128),
+                hid_size_aggr=(128, 128),
+                hid_size_update=(128, 128),
+                out_dim=64,
+                n_layers=gnn_layers,
+            )
         if discrete_action and use_gru:
             if discrete_joint:
                 if n_discrete_actions is None or n_discrete_actions <= 0:

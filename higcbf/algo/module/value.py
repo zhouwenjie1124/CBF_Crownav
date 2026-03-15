@@ -6,7 +6,7 @@ import jax.numpy as jnp
 from typing import Type
 
 from ...nn.mlp import MLP
-from ...nn.gnn import GNN
+from ...nn.gnn import GNN, SelfAttnGNN
 from ...nn.utils import default_nn_init
 from ...utils.typing import Array, Params
 from ...utils.graph import GraphsTuple
@@ -83,21 +83,32 @@ class ValueNet:
             concat_robot_state: bool = False,
             use_gru: bool = False,
             rnn_hidden_dim: int = 64,
+            use_hetero_attn: bool = False,
     ):
         self.node_dim = node_dim
         self.edge_dim = edge_dim
         self.n_agents = n_agents
         self.use_gru = use_gru
         self.rnn_hidden_dim = rnn_hidden_dim
-        self.value_gnn = ft.partial(
-            GNN,
-            msg_dim=64,
-            hid_size_msg=(128, 128),
-            hid_size_aggr=(128, 128),
-            hid_size_update=(128, 128),
-            out_dim=64,
-            n_layers=gnn_layers
-        )
+        if use_hetero_attn:
+            # CrowdNav_HEIGHT-style Graph Transformer for value estimation
+            self.value_gnn = ft.partial(
+                SelfAttnGNN,
+                out_dim=64,
+                attn_dim=64,
+                num_heads=4,
+                n_layers=gnn_layers,
+            )
+        else:
+            self.value_gnn = ft.partial(
+                GNN,
+                msg_dim=64,
+                hid_size_msg=(128, 128),
+                hid_size_aggr=(128, 128),
+                hid_size_update=(128, 128),
+                out_dim=64,
+                n_layers=gnn_layers,
+            )
         self.value_attn = ft.partial(
             MLP,
             hid_sizes=(128, 128),

@@ -17,7 +17,7 @@ from .ped_env_wrapper import PedEnvWrapper
 from .ped_sim import PedCBFController, ped_sfm_step, ped_cbf_step, ped_orca_step, build_ped_graph
 from .robot_dynamics import RobotDynamics
 from .path_planner import PathPlanner
-from .rewards import assemble_legacy_proactive, assemble_paper
+from .rewards import assemble_legacy_proactive, assemble_paper, assemble_height
 
 
 class RobotPedEnv(MultiAgentEnv):
@@ -786,6 +786,17 @@ class RobotPedEnv(MultiAgentEnv):
         lidar_dist = self._get_lidar_dist(graph)
         theta_d = self._get_theta_d(graph, next_agent_states)
 
+        if reward_mode == "height":
+            return assemble_height(
+                agent_pos=agent_pos,
+                next_agent_states=next_agent_states,
+                goal_pos=goal_pos,
+                ped_pos=ped_pos,
+                lidar_dist=lidar_dist,
+                is_timeout=is_timeout,
+                collision_obs_attempt=collision_obs_attempt,
+                params=self._params,
+            )
         if reward_mode == "paper":
             return assemble_paper(
                 agent_pos=agent_pos,
