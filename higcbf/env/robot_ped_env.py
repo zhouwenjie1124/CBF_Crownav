@@ -132,6 +132,7 @@ class RobotPedEnv(MultiAgentEnv):
         "r_obstacle": -0.2,
         "d_r": None,  # collision radius (synced to car_radius in __init__)
         "d_m": 1.2,
+        
         "r_rotation": -0.1,
         "omega_m": 1.0,
         # safety penalty mode: "sum" (all close agents/obs) or "min" (only nearest)

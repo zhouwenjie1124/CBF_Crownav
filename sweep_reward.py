@@ -133,7 +133,8 @@ def _parse_last_eval(output: str) -> dict:
     }
 
 
-def run_trial(cmd: list[str], trial_idx: int, params: dict, timeout: int) -> dict:
+def run_trial(cmd: list[str], trial_idx: int, params: dict, timeout: int,
+              sub_env: dict | None = None) -> dict:
     """Run one trial subprocess and return its result dict."""
     t0 = time.time()
     label = f"trial_{trial_idx:03d}"
@@ -146,6 +147,7 @@ def run_trial(cmd: list[str], trial_idx: int, params: dict, timeout: int) -> dic
             text=True,
             timeout=timeout,
             cwd=os.path.dirname(os.path.abspath(__file__)),
+            env=sub_env,
         )
         stdout = result.stdout
         stderr = result.stderr
@@ -160,6 +162,10 @@ def run_trial(cmd: list[str], trial_idx: int, params: dict, timeout: int) -> dic
         return {"trial": trial_idx, "params": params, "success": None,
                 "unsafe_frac": None, "reward": None, "score": -999.0,
                 "status": f"error: {e}", "elapsed_s": time.time() - t0}
+
+    # ---- print GPU device being used ----
+    device_str = (sub_env or {}).get("CUDA_VISIBLE_DEVICES", os.environ.get("CUDA_VISIBLE_DEVICES", "default"))
+    print(f"[sweep] {label}  GPU: CUDA_VISIBLE_DEVICES={device_str}")
 
     elapsed = time.time() - t0
     metrics = _parse_last_eval(stdout)
@@ -280,6 +286,12 @@ def main():
                         help="Extra args appended to every train.py call.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print commands without executing.")
+    parser.add_argument("--device", type=str, default="0",
+                        help="CUDA_VISIBLE_DEVICES for subprocesses (e.g. '0', '0,1'). "
+                             "Pass '' to inherit from parent without override.")
+    parser.add_argument("--mem-fraction", type=float, default=None,
+                        help="XLA_PYTHON_CLIENT_MEM_FRACTION per subprocess. "
+                             "Defaults to 1/jobs when --jobs > 1 to avoid OOM.")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -288,9 +300,28 @@ def main():
 
     os.makedirs(args.log_dir, exist_ok=True)
 
+    # ---- Build subprocess environment with GPU settings ----
+    sub_env = os.environ.copy()
+    sub_env["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+    # Disable CUDA command buffers to avoid OOM on CUDA graph instantiation
+    # (XLA creates too many graphs when JIT-compiling parallel envs).
+    existing_xla_flags = sub_env.get("XLA_FLAGS", "")
+    if "--xla_gpu_enable_command_buffer=" not in existing_xla_flags:
+        sub_env["XLA_FLAGS"] = (existing_xla_flags + " --xla_gpu_enable_command_buffer=").strip()
+    if args.device != "":
+        sub_env["CUDA_VISIBLE_DEVICES"] = args.device
+    mem_frac = args.mem_fraction
+    if mem_frac is None and args.jobs > 1:
+        mem_frac = 1.0 / args.jobs
+    if mem_frac is not None:
+        sub_env["XLA_PYTHON_CLIENT_MEM_FRACTION"] = f"{mem_frac:.3f}"
+
     print(f"[sweep] Config: {args.config}")
     print(f"[sweep] Trials: {args.n_trials}  Jobs: {args.jobs}  Timeout: {args.timeout}s")
     print(f"[sweep] Log dir: {args.log_dir}")
+    print(f"[sweep] GPU: CUDA_VISIBLE_DEVICES={sub_env.get('CUDA_VISIBLE_DEVICES', '(inherited)')}"
+          f"  MEM_FRACTION={sub_env.get('XLA_PYTHON_CLIENT_MEM_FRACTION', '(not set)')}"
+          f"  XLA_FLAGS={sub_env.get('XLA_FLAGS', '(not set)')}")
     print()
 
     cmds = []
@@ -308,13 +339,13 @@ def main():
     results = []
     if args.jobs <= 1:
         for i, params, cmd in cmds:
-            r = run_trial(cmd, i, params, args.timeout)
+            r = run_trial(cmd, i, params, args.timeout, sub_env)
             results.append(r)
             write_csv(results, args.output)  # save incrementally
     else:
         with concurrent.futures.ProcessPoolExecutor(max_workers=args.jobs) as executor:
             futures = {
-                executor.submit(run_trial, cmd, i, params, args.timeout): i
+                executor.submit(run_trial, cmd, i, params, args.timeout, sub_env): i
                 for i, params, cmd in cmds
             }
             for fut in concurrent.futures.as_completed(futures):
